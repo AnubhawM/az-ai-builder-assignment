@@ -9,3 +9,7 @@ __pycache__/
 .env
 
 temp_uploads
+
+# macOS
+.DS_Store
+

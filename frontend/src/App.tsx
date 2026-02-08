@@ -6,6 +6,7 @@ import 'react-toastify/dist/ReactToastify.css';
 import MainLayout from './layouts/MainLayout';
 import Card from './components/ui/Card';
 import ResearchBot from './components/ResearchBot';
+import PowerPointGenerator from './components/PowerPointGenerator';
 
 interface ProposalResponse {
   response: string;
@@ -74,6 +75,16 @@ const App: React.FC = () => {
     <MainLayout>
       <div className="w-screen px-6 py-8">
         <div className="max-w-7xl mx-auto">
+          {/* PowerPoint Generator - New Primary Feature */}
+          <PowerPointGenerator />
+
+          {/* Divider */}
+          <div className="flex items-center my-12 max-w-2xl mx-auto">
+            <div className="flex-1 border-t border-gray-300"></div>
+            <span className="px-4 text-gray-500 text-sm font-medium">OR TRY OTHER TOOLS</span>
+            <div className="flex-1 border-t border-gray-300"></div>
+          </div>
+
           <Card className="max-w-2xl mx-auto">
             <h2 className="text-2xl font-bold mb-2 text-gray-800 flex items-center">
               <span className="mr-2">🦞</span> Research Proposal Generator
@@ -128,3 +139,4 @@ const App: React.FC = () => {
 };
 
 export default App;
+
