@@ -1,161 +1,138 @@
 """
-OpenClaw WebSocket Client
-Handles communication with the OpenClaw Gateway via WebSocket protocol.
+OpenClaw CLI Client
+Handles communication with OpenClaw via subprocess CLI calls.
+This is simpler and more robust than the WebSocket approach.
 """
 
+import subprocess
 import json
 import uuid
-import websocket
-import threading
-import time
 
-class OpenClawClient:
-    def __init__(self, gateway_url="ws://localhost:18789", token=None):
-        self.gateway_url = gateway_url
-        self.token = token
-        self.ws = None
-        self.connected = False
-        self.responses = {}
-        self.agent_output = {}
-        self.lock = threading.Lock()
-        
-    def _generate_id(self):
-        return str(uuid.uuid4())[:8]
+
+def ask_openclaw(message: str, session_id: str = None, timeout: int = 300, use_json: bool = True) -> dict:
+    """
+    Send a message to OpenClaw agent via CLI and get the response.
     
-    def connect(self):
-        """Establish connection to OpenClaw Gateway"""
-        self.ws = websocket.create_connection(self.gateway_url)
-        
-        # Send connect handshake
-        connect_req = {
-            "type": "req",
-            "id": self._generate_id(),
-            "method": "connect",
-            "params": {
-                "minProtocol": 1,
-                "maxProtocol": 1,
-                "client": {
-                    "id": "python-backend",
-                    "displayName": "Research Bot Backend",
-                    "version": "1.0.0",
-                    "platform": "python",
-                    "mode": "headless"
-                },
-                "caps": ["agent"],
-                "auth": {"token": self.token} if self.token else None
-            }
-        }
-        
-        self.ws.send(json.dumps(connect_req))
-        response = json.loads(self.ws.recv())
-        
-        if response.get("ok"):
-            self.connected = True
-            return True
-        else:
-            raise Exception(f"Failed to connect: {response.get('error')}")
+    Args:
+        message: The message/prompt to send to the agent
+        session_id: Optional session ID for conversation continuity
+        timeout: Command timeout in seconds (default 300 = 5 minutes)
+        use_json: Whether to request JSON output (default True)
     
-    def send_agent_request(self, message, session_id="research_session", timeout=120):
-        """
-        Send a message to the OpenClaw agent and wait for the response.
-        Returns the full agent output.
-        """
-        if not self.connected:
-            self.connect()
+    Returns:
+        dict with 'success', 'output', and optionally 'error' keys
+    """
+    # Build the command
+    cmd = ["openclaw", "agent", "--message", message]
+    
+    if session_id:
+        cmd.extend(["--session-id", session_id])
+    
+    if use_json:
+        cmd.append("--json")
+    
+    cmd.extend(["--timeout", str(timeout)])
+    
+    try:
+        print(f"Running OpenClaw command: {' '.join(cmd[:4])}...")
         
-        req_id = self._generate_id()
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout + 30  # Give subprocess a bit more time than the agent timeout
+        )
         
-        # Send the agent request
-        agent_req = {
-            "type": "req",
-            "id": req_id,
-            "method": "agent",
-            "params": {
-                "message": message,
-                "sessionId": session_id
+        # Check for errors
+        if result.returncode != 0:
+            print(f"OpenClaw CLI error (exit code {result.returncode})")
+            print(f"Stderr: {result.stderr}")
+            return {
+                "success": False,
+                "output": result.stdout,
+                "error": result.stderr or f"Exit code {result.returncode}"
             }
-        }
         
-        self.ws.send(json.dumps(agent_req))
-        
-        # Collect responses and events
-        output_parts = []
-        run_id = None
-        start_time = time.time()
-        
-        while True:
-            if time.time() - start_time > timeout:
-                raise TimeoutError("Agent request timed out")
-            
+        # Parse JSON output if requested
+        if use_json:
             try:
-                self.ws.settimeout(5.0)
-                raw = self.ws.recv()
-                frame = json.loads(raw)
-            except websocket.WebSocketTimeoutException:
-                continue
-            except Exception as e:
-                print(f"WebSocket error: {e}")
-                break
-            
-            # Handle different frame types
-            if frame.get("type") == "res" and frame.get("id") == req_id:
-                payload = frame.get("payload", {})
-                if payload.get("status") == "accepted":
-                    run_id = payload.get("runId")
-                    print(f"Agent request accepted, runId: {run_id}")
-                elif payload.get("status") in ["ok", "error"]:
-                    # Final response
+                # The output might have deprecation warnings before the JSON
+                # Find the JSON part (starts with { or [)
+                stdout = result.stdout.strip()
+                json_start = stdout.find('{')
+                if json_start == -1:
+                    json_start = stdout.find('[')
+                
+                if json_start != -1:
+                    json_str = stdout[json_start:]
+                    parsed = json.loads(json_str)
+                    
+                    # Handle OpenClaw's actual response format
+                    # The response has: result.payloads[].text
+                    output_text = ""
+                    if "result" in parsed and "payloads" in parsed["result"]:
+                        payloads = parsed["result"]["payloads"]
+                        # Get the last (most complete) payload text
+                        for payload in payloads:
+                            if payload.get("text"):
+                                output_text = payload["text"]  # Keep overwriting to get the last one
+                    elif "reply" in parsed:
+                        output_text = parsed["reply"]
+                    elif "output" in parsed:
+                        output_text = parsed["output"]
+                    else:
+                        output_text = str(parsed)
+                    
                     return {
-                        "success": payload.get("status") == "ok",
-                        "output": "\n".join(output_parts),
-                        "summary": payload.get("summary", ""),
-                        "run_id": run_id
+                        "success": parsed.get("status") == "ok" if "status" in parsed else True,
+                        "output": output_text,
+                        "raw": parsed
                     }
+                else:
+                    # No JSON found, return as plain text
+                    return {
+                        "success": True,
+                        "output": stdout
+                    }
+            except json.JSONDecodeError as e:
+                print(f"Failed to parse JSON: {e}")
+                return {
+                    "success": True,
+                    "output": result.stdout.strip()
+                }
+        else:
+            return {
+                "success": True,
+                "output": result.stdout.strip()
+            }
             
-            elif frame.get("type") == "event" and frame.get("event") == "agent":
-                # Streamed agent output
-                payload = frame.get("payload", {})
-                if "text" in payload:
-                    output_parts.append(payload["text"])
-                    print(f"Agent: {payload['text'][:100]}...")
-                elif "content" in payload:
-                    output_parts.append(str(payload["content"]))
-            
-            elif frame.get("type") == "event" and frame.get("event") == "tick":
-                # Keepalive, ignore
-                pass
-        
+    except subprocess.TimeoutExpired:
         return {
             "success": False,
-            "output": "\n".join(output_parts),
-            "error": "Connection closed unexpectedly"
+            "output": "",
+            "error": f"Command timed out after {timeout} seconds"
         }
-    
-    def close(self):
-        """Close the WebSocket connection"""
-        if self.ws:
-            self.ws.close()
-            self.connected = False
+    except FileNotFoundError:
+        return {
+            "success": False,
+            "output": "",
+            "error": "OpenClaw CLI not found. Make sure 'openclaw' is installed and in your PATH."
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "output": "",
+            "error": str(e)
+        }
 
 
-# Convenience function for one-shot requests
-def ask_openclaw(message, session_id="research_session", gateway_url="ws://localhost:18789", token=None):
-    """
-    Send a message to OpenClaw and get the response.
-    This is a convenience wrapper for simple use cases.
-    """
-    client = OpenClawClient(gateway_url=gateway_url, token=token)
-    try:
-        result = client.send_agent_request(message, session_id=session_id)
-        return result
-    finally:
-        client.close()
+def generate_session_id() -> str:
+    """Generate a unique session ID for conversation continuity."""
+    return str(uuid.uuid4())[:8]
 
 
 if __name__ == "__main__":
     # Test the client
-    result = ask_openclaw(
-        "What is 2 + 2?",
-        token="45f4aa260648382416916c336bec303480c6399348f0247c"
-    )
+    print("Testing OpenClaw CLI client...")
+    result = ask_openclaw("What is 2 + 2?")
     print(f"Result: {result}")

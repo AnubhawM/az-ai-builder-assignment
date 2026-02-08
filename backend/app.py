@@ -1,17 +1,15 @@
 from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
-from openai import OpenAI
 import os
 import subprocess
 import time
 from dotenv import load_dotenv
 import requests
+from openclaw_client import ask_openclaw
 
 # Load environment variables from .env file inside backend folder
 env_path = os.path.join(os.path.dirname(__file__), '.env')
 load_dotenv(dotenv_path=env_path)
-
-client = OpenAI()
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -48,46 +46,70 @@ def handle_options():
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
     return response
 
-# Main route to generate a response from OpenAI API
+# Main route to generate a research proposal as a Google Doc
 @app.route('/generate', methods=['POST'])
 def generate():
     try:
         data = request.json
         if not data or not data.get('prompt'):
-            return jsonify({'error': 'Prompt is required'}), 400
+            return jsonify({'error': 'Research topic is required'}), 400
 
-        # Call OpenAI API
-        model = "gpt-4o-mini"
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": data['prompt']}
-            ],
-            max_tokens=500,
-            temperature=0.7,
+        topic = data['prompt'].strip()
+        
+        # Craft a prompt that instructs OpenClaw to:
+        # 1. Research the topic
+        # 2. Create a structured project proposal
+        # 3. Save it as a Google Doc using the gog skill
+        # Simple prompt: research and return proposal as text
+        prompt = f"""Research this topic using web_search: "{topic}"
+
+Based on your research findings, write a comprehensive project proposal with these sections:
+
+1. **Executive Summary** (2-3 paragraphs)
+2. **Problem Statement** - What problem does this address?
+3. **Background & Key Findings** - Include facts from your research
+4. **Proposed Solution** - Detailed approach
+5. **Methodology** - How to execute
+6. **Timeline & Milestones** - Key phases
+7. **Expected Outcomes** - What success looks like
+8. **Risks & Mitigation** - Challenges and solutions
+9. **Conclusion** - Summary and next steps
+
+Execute the web search NOW, then write the full proposal. Return the complete proposal text."""
+
+        # Call OpenClaw via CLI
+        result = ask_openclaw(
+            message=prompt,
+            session_id="proposal_session",
+            timeout=180  # 3 minutes for research
         )
 
-        response_text = response.choices[0].message.content.strip()
-        return jsonify({'response': response_text}), 200
+        if not result.get("success"):
+            print(f"OpenClaw error: {result.get('error', 'Unknown error')}")
+            return jsonify({'error': 'Failed to generate proposal', 'details': result.get('output', '')}), 500
+
+        output = result.get('output', '').strip()
+        
+        return jsonify({
+            'response': output,
+            'type': 'text',
+            'message': 'Research proposal generated!'
+        }), 200
 
     except Exception as e:
-        print(f"Error generating response: {e}")
-        return jsonify({'error': 'Failed to generate response'}), 500
+        print(f"Error generating proposal: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': 'Failed to generate proposal'}), 500
 
 @app.route('/research', methods=['POST'])
 def research():
     try:
-        from openclaw_client import ask_openclaw
-        
         data = request.json
         topic = data.get('topic')
         if not topic:
             return jsonify({'error': 'Topic is required'}), 400
 
-        # Get the gateway token from config (you can also put this in .env)
-        gateway_token = os.getenv('OPENCLAW_GATEWAY_TOKEN', '45f4aa260648382416916c336bec303480c6399348f0247c')
-        
         # Construct the prompt
         prompt = (
             f"Research the following topic: '{topic}'. "
@@ -99,13 +121,11 @@ def research():
             f"Return a confirmation when done."
         )
         
-        # Use WebSocket to communicate with OpenClaw Gateway
-        print(f"Sending request to OpenClaw Gateway via WebSocket...")
+        # Use CLI to communicate with OpenClaw
+        print(f"Sending request to OpenClaw via CLI...")
         result = ask_openclaw(
             message=prompt,
-            session_id="research_session",
-            gateway_url="ws://localhost:18789",
-            token=gateway_token
+            session_id="research_session"
         )
         
         if not result.get("success"):
