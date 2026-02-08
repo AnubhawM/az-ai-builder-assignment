@@ -250,10 +250,14 @@ When you're done, provide a brief summary of:
 
         # The webhook API returns 202 for async runs
         # The task is now running in the background
+        # Include timestamp so frontend can poll for files created after this time
+        start_timestamp = time.time()
+        
         return jsonify({
             'message': 'PowerPoint generation started! OpenClaw is researching your topic and generating the presentation. This typically takes 1-2 minutes.',
             'output_directory': PPT_OUTPUT_DIR,
             'status': 'pending',
+            'start_timestamp': start_timestamp,
             'note': 'Check the output directory for your generated PowerPoint file.'
         }), 202
 
@@ -265,6 +269,120 @@ When you're done, provide a brief summary of:
             'error': str(e),
             'status': 'error',
             'output_directory': PPT_OUTPUT_DIR
+        }), 500
+
+
+@app.route('/check-ppt-status', methods=['GET'])
+def check_ppt_status():
+    """
+    Check if new PowerPoint files have been created in the output directory.
+    Used by frontend to poll for completion.
+    
+    Query params:
+        - since: Unix timestamp to check for files created after this time
+    """
+    try:
+        since_timestamp = request.args.get('since', type=float, default=0)
+        
+        if not os.path.exists(PPT_OUTPUT_DIR):
+            return jsonify({
+                'status': 'pending',
+                'files': [],
+                'message': 'Output directory does not exist yet'
+            }), 200
+        
+        # Get all .pptx files in the output directory
+        all_files = []
+        new_files = []
+        
+        for filename in os.listdir(PPT_OUTPUT_DIR):
+            if filename.endswith('.pptx'):
+                filepath = os.path.join(PPT_OUTPUT_DIR, filename)
+                file_stat = os.stat(filepath)
+                file_info = {
+                    'name': filename,
+                    'path': filepath,
+                    'size_bytes': file_stat.st_size,
+                    'created_at': file_stat.st_mtime,
+                    'size_formatted': f"{file_stat.st_size / 1024:.1f} KB"
+                }
+                all_files.append(file_info)
+                
+                # Check if file was created after the start timestamp
+                if file_stat.st_mtime > since_timestamp:
+                    new_files.append(file_info)
+        
+        # Sort by creation time (newest first)
+        all_files.sort(key=lambda x: x['created_at'], reverse=True)
+        new_files.sort(key=lambda x: x['created_at'], reverse=True)
+        
+        if new_files:
+            return jsonify({
+                'status': 'completed',
+                'files': new_files,
+                'all_files': all_files,
+                'message': f'Found {len(new_files)} new PowerPoint file(s)!',
+                'output_directory': PPT_OUTPUT_DIR
+            }), 200
+        else:
+            return jsonify({
+                'status': 'pending',
+                'files': [],
+                'all_files': all_files,
+                'message': 'No new files yet. Still generating...',
+                'output_directory': PPT_OUTPUT_DIR
+            }), 200
+            
+    except Exception as e:
+        print(f"Error checking PPT status: {e}")
+        return jsonify({
+            'status': 'error',
+            'error': str(e)
+        }), 500
+
+
+# Add OPTIONS handler for the new endpoint
+@app.route('/check-ppt-status', methods=['OPTIONS'])
+@app.route('/open-output-dir', methods=['OPTIONS'])
+def handle_check_ppt_options():
+    response = make_response()
+    origin = request.headers.get('Origin')
+    if origin in ["http://localhost:5173", "http://localhost:5174"]:
+        response.headers['Access-Control-Allow-Origin'] = origin
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    return response
+
+
+@app.route('/open-output-dir', methods=['POST'])
+def open_output_dir():
+    """
+    Open the PPT output directory in the system file explorer (Finder on macOS).
+    """
+    try:
+        if not os.path.exists(PPT_OUTPUT_DIR):
+            os.makedirs(PPT_OUTPUT_DIR, exist_ok=True)
+        
+        # Use 'open' command on macOS to open Finder at the directory
+        result = subprocess.run(['open', PPT_OUTPUT_DIR], capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            return jsonify({
+                'success': True,
+                'message': f'Opened {PPT_OUTPUT_DIR} in Finder',
+                'directory': PPT_OUTPUT_DIR
+            }), 200
+        else:
+            return jsonify({
+                'success': False,
+                'error': f'Failed to open directory: {result.stderr}'
+            }), 500
+            
+    except Exception as e:
+        print(f"Error opening output directory: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
         }), 500
 
 
