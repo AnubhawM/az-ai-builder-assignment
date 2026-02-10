@@ -1,2 +1,15 @@
 # Environment variables
 .env
+
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Environment files
+.env
+
+temp_uploads
+
+# macOS
+.DS_Store
+

@@ -1,0 +1,16 @@
+services:
+  openclaw:
+    build: .
+    container_name: openclaw-isolated
+    ports:
+      - "18789:18789"
+    volumes:
+      - ~/.openclaw:/root/.openclaw
+      # - ~/.openclaw:/home/node/.openclaw
+      - .:/root/.openclaw/workspace/assignment_project
+    environment:
+      - NODE_ENV=development
+      - OPENCLAW_GATEWAY_BIND=lan
+    env_file:
+      - ./backend/.env
+    command: ["openclaw", "gateway", "run", "--verbose"]
