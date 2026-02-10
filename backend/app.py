@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 import requests
 from openclaw_client import ask_openclaw
 from openclaw_webhook_client import trigger_agent
+from workflow_routes import workflow_bp
 
 # Load environment variables from .env file inside backend folder
 env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -26,6 +27,9 @@ CORS(app,
     origins=["http://localhost:5173", "http://localhost:5174"],
     allow_headers=["Content-Type"],
     methods=["GET", "POST", "OPTIONS"])
+
+# Register the workflow API blueprint
+app.register_blueprint(workflow_bp)
 
 # Add CORS headers to all responses
 @app.after_request
