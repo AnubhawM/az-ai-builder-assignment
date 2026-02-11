@@ -1,61 +1,64 @@
 // src/components/Header.tsx
-import React, { useEffect } from 'react';  // Add useEffect import
-import { useAuth0 } from '@auth0/auth0-react';
+import React from 'react';
 
-const Header: React.FC = () => {
-  const { isAuthenticated, user, loginWithRedirect, logout, getAccessTokenSilently } = useAuth0();  // Add getAccessTokenSilently
+interface User {
+  id: number;
+  name: string;
+  role: string;
+  email: string;
+}
 
-  useEffect(() => {
-    const registerUser = async () => {
-      if (isAuthenticated && user) {
-        try {
-          const token = await getAccessTokenSilently();
-          const response = await fetch('http://localhost:5000/register', {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${token}`,
-              'Content-Type': 'application/json'
-            }
-          });
-          const data = await response.json();
-          console.log('User registration:', data);
-        } catch (error) {
-          console.error('Registration error:', error);
-        }
-      }
-    };
+interface HeaderProps {
+  currentUser: User | null;
+  onSwitchPersona: () => void;
+}
 
-    registerUser();
-  }, [isAuthenticated, user, getAccessTokenSilently]);
+const roleLabels: Record<string, string> = {
+  researcher: 'Researcher',
+  compliance_expert: 'Compliance Expert',
+  design_reviewer: 'Design Reviewer',
+};
 
+const Header: React.FC<HeaderProps> = ({ currentUser, onSwitchPersona }) => {
   return (
-    <nav className="w-full bg-blue-500">
-      <div className="w-full px-6 py-4">
+    <nav className="w-full border-b border-[var(--color-border)]"
+      style={{ background: 'rgba(15, 22, 41, 0.85)', backdropFilter: 'blur(12px)' }}>
+      <div className="w-full px-6 py-3">
         <div className="flex justify-between items-center max-w-7xl mx-auto">
-          <h1 className="text-2xl font-bold text-white">TEMPLATE</h1>
-          <div className="flex items-center gap-4">
-
-            {isAuthenticated ? (
-              <>
-                <span className="text-white hidden sm:inline">Welcome, {user?.name}</span>
-                <button
-                  onClick={() => logout({ 
-                    logoutParams: { returnTo: window.location.origin }
-                  })}
-                  className="bg-white px-6 py-2 rounded-md text-blue-500 hover:bg-blue-50"
-                >
-                  Log Out
-                </button>
-              </>
-            ) : (
-              <button
-                onClick={() => loginWithRedirect()}
-                className="bg-white px-6 py-2 rounded-md text-blue-500 hover:bg-blue-50"
-              >
-                Log In
-              </button>
-            )}
+          {/* Logo / Title */}
+          <div className="flex items-center gap-3">
+            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-purple-500 to-indigo-600 flex items-center justify-center text-white font-bold text-sm">
+              AX
+            </div>
+            <div>
+              <h1 className="text-lg font-bold text-white tracking-tight leading-none">
+                AIXplore
+              </h1>
+              <p className="text-[10px] font-medium text-purple-400 tracking-widest uppercase leading-none mt-0.5">
+                Capability Exchange
+              </p>
+            </div>
           </div>
+
+          {/* User Info */}
+          {currentUser && (
+            <div className="flex items-center gap-4">
+              <div className="text-right hidden sm:block">
+                <p className="text-sm font-medium text-white leading-none">
+                  {currentUser.name}
+                </p>
+                <p className="text-xs text-purple-400 mt-0.5">
+                  {roleLabels[currentUser.role] || currentUser.role}
+                </p>
+              </div>
+              <button
+                onClick={onSwitchPersona}
+                className="btn btn-ghost text-xs px-3 py-1.5"
+              >
+                Switch Persona
+              </button>
+            </div>
+          )}
         </div>
       </div>
     </nav>

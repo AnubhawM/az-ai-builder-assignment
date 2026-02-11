@@ -1,19 +1,14 @@
 // src/layouts/MainLayout.tsx
 import React from 'react';
-import Header from '../components/Header';
 
-const MainLayout: React.FC<{children: React.ReactNode}> = ({children}) => {
+const MainLayout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   return (
-    <div className="w-full min-h-screen bg-gray-100">
-      <Header />
+    <div className="w-full min-h-screen">
       <main className="w-full">
-        <div className="w-full">
-          {children}
-        </div>
+        {children}
       </main>
     </div>
   );
 };
-
 
 export default MainLayout;
