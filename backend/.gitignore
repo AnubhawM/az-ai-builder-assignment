@@ -10,6 +10,9 @@ __pycache__/
 
 temp_uploads
 
+# SQLite database
+*.db
+
 # macOS
 .DS_Store
 
