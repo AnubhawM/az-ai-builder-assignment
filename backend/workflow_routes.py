@@ -27,7 +27,10 @@ from crud import (
     update_workflow_status,
     create_workflow_step, get_active_step,
     update_step_status,
-    create_event
+    create_event,
+    get_open_work_requests, get_work_request_by_id,
+    create_work_request, create_volunteer,
+    update_volunteer_status, get_volunteer_by_id
 )
 from openclaw_client import generate_session_id
 from workflow_service import start_research, start_refinement, start_ppt_generation
@@ -450,9 +453,183 @@ def _process_slack_approval(workflow_id: int, slack_user_id: str,
 
 
 # ──────────────────────────────────────
+# Marketplace Endpoints
+# ──────────────────────────────────────
+
+@workflow_bp.route('/api/marketplace', methods=['GET'])
+def list_marketplace():
+    """List all open work requests on the marketplace board."""
+    db = SessionLocal()
+    try:
+        requests = get_open_work_requests(db)
+        return jsonify({
+            "requests": [r.to_dict() for r in requests]
+        }), 200
+    finally:
+        db.close()
+
+
+@workflow_bp.route('/api/marketplace', methods=['POST'])
+def post_work_request():
+    """
+    Post a new need to the marketplace.
+    Triggers agent auto-selection logic.
+    """
+    db = SessionLocal()
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"error": "Request body missing"}), 400
+
+        # Create the request
+        work_request = create_work_request(db, data)
+
+        # ── AGENT AUTO-VOLUNTEER LOGIC ──
+        # Check if any agents match the required capabilities
+        required_caps = data.get("required_capabilities", [])
+        from database.models import User
+        agents = db.query(User).filter(User.is_agent == True).all()
+
+        for agent in agents:
+            # Simple matching: if agent role matches or "research" is in caps and agent is OpenClaw
+            if "research" in required_caps and agent.email == "agent@openclaw.ai":
+                create_volunteer(db, {
+                    "request_id": work_request.id,
+                    "user_id": agent.id,
+                    "note": "I'm the OpenClaw research agent. I can perform web searches and generate reports."
+                })
+
+        return jsonify({
+            "message": "Work request posted to marketplace!",
+            "request": work_request.to_dict()
+        }), 201
+    except Exception as e:
+        print(f"Error posting work request: {e}")
+        return jsonify({"error": str(e)}), 500
+    finally:
+        db.close()
+
+
+@workflow_bp.route('/api/marketplace/<int:request_id>', methods=['GET'])
+def get_marketplace_detail(request_id):
+    """View a specific work request and its volunteers."""
+    db = SessionLocal()
+    try:
+        work_request = get_work_request_by_id(db, request_id)
+        if not work_request:
+            return jsonify({"error": "Request not found"}), 404
+        return jsonify({"request": work_request.to_dict()}), 200
+    finally:
+        db.close()
+
+
+@workflow_bp.route('/api/marketplace/<int:request_id>/volunteer', methods=['POST'])
+def volunteer_for_task(request_id):
+    """A human user manually volunteers for a task."""
+    db = SessionLocal()
+    try:
+        data = request.json
+        user_id = data.get("user_id")
+        note = data.get("note", "")
+
+        if not user_id:
+            return jsonify({"error": "user_id is required"}), 400
+
+        volunteer = create_volunteer(db, {
+            "request_id": request_id,
+            "user_id": user_id,
+            "note": note
+        })
+
+        return jsonify({
+            "message": "Successfully volunteered!",
+            "volunteer": volunteer.to_dict()
+        }), 201
+    finally:
+        db.close()
+
+
+@workflow_bp.route('/api/marketplace/<int:request_id>/accept', methods=['POST'])
+def accept_volunteer(request_id):
+    """
+    The Handshake: Requester accepts a volunteer to start the work.
+    This replaces the old direct-create-workflow logic.
+    """
+    db = SessionLocal()
+    try:
+        data = request.json
+        volunteer_id = data.get("volunteer_id")
+
+        if not volunteer_id:
+            return jsonify({"error": "volunteer_id is required"}), 400
+
+        work_request = get_work_request_by_id(db, request_id)
+        volunteer = get_volunteer_by_id(db, volunteer_id)
+
+        if not work_request or not volunteer:
+            return jsonify({"error": "Request or Volunteer not found"}), 404
+
+        # 1. Update statuses
+        update_volunteer_status(db, volunteer_id, "accepted")
+        work_request.status = "assigned"
+
+        # 2. Create the actual Workflow from the request
+        user = volunteer.user
+        session_id = f"workflow-{generate_session_id()}"
+
+        workflow = create_workflow(
+            db,
+            user_id=work_request.requester_id,
+            title=work_request.title,
+            workflow_type="ppt_generation", # Default
+            openclaw_session_id=session_id,
+            parent_id=work_request.parent_workflow_id
+        )
+
+        # 3. Create the first step and assign it
+        step_type = "agent_research" if user.is_agent else "human_research"
+        provider_type = "agent" if user.is_agent else "human"
+
+        create_workflow_step(
+            db, workflow_id=workflow.id, step_order=1,
+            step_type=step_type, provider_type=provider_type,
+            assigned_to=user.id,
+            input_data={"topic": work_request.title, "description": work_request.description}
+        )
+
+        # 4. Success event
+        create_event(
+            db, workflow_id=workflow.id, event_type="created",
+            actor_id=work_request.requester_id, actor_type="human", channel="web",
+            message=f"Handshake complete! {user.name} is starting work on: {work_request.title}"
+        )
+
+        # 5. If it's an agent, trigger the service logic
+        if user.is_agent and user.email == "agent@openclaw.ai":
+            start_research(workflow.id, work_request.title, session_id)
+
+        db.commit()
+        return jsonify({
+            "message": "Handshake complete! Work has begun.",
+            "workflow_id": workflow.id
+        }), 200
+
+    except Exception as e:
+        db.rollback()
+        print(f"Error accepting volunteer: {e}")
+        return jsonify({"error": str(e)}), 500
+    finally:
+        db.close()
+
+
+# ──────────────────────────────────────
 # OPTIONS handlers for CORS
 # ──────────────────────────────────────
 
+@workflow_bp.route('/api/marketplace', methods=['OPTIONS'])
+@workflow_bp.route('/api/marketplace/<int:request_id>', methods=['OPTIONS'])
+@workflow_bp.route('/api/marketplace/<int:request_id>/volunteer', methods=['OPTIONS'])
+@workflow_bp.route('/api/marketplace/<int:request_id>/accept', methods=['OPTIONS'])
 @workflow_bp.route('/api/users', methods=['OPTIONS'])
 @workflow_bp.route('/api/workflows', methods=['OPTIONS'])
 @workflow_bp.route('/api/workflows/<int:workflow_id>', methods=['OPTIONS'])

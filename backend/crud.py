@@ -2,7 +2,7 @@
 # Database CRUD operations for the AIXplore Capability Exchange
 
 from sqlalchemy.orm import Session
-from database.models import User, Workflow, WorkflowStep, WorkflowEvent
+from database.models import User, Workflow, WorkflowStep, WorkflowEvent, WorkRequest, Volunteer
 
 
 # ──────────────────────────────────────
@@ -15,6 +15,7 @@ def create_user(db: Session, user_data: dict) -> User:
         email=user_data['email'],
         role=user_data.get('role', 'researcher'),
         slack_user_id=user_data.get('slack_user_id'),
+        is_agent=user_data.get('is_agent', False),
         is_active=user_data.get('is_active', True),
     )
     db.add(new_user)
@@ -41,13 +42,15 @@ def get_all_users(db: Session) -> list[User]:
 
 def create_workflow(db: Session, user_id: int, title: str,
                     workflow_type: str = "ppt_generation",
-                    openclaw_session_id: str = None) -> Workflow:
+                    openclaw_session_id: str = None,
+                    parent_id: int = None) -> Workflow:
     workflow = Workflow(
         user_id=user_id,
         workflow_type=workflow_type,
         title=title,
         status="pending",
         openclaw_session_id=openclaw_session_id,
+        parent_id=parent_id,
     )
     db.add(workflow)
     db.commit()
@@ -199,3 +202,69 @@ def get_events_for_workflow(db: Session, workflow_id: int) -> list[WorkflowEvent
         .order_by(WorkflowEvent.created_at.asc())
         .all()
     )
+
+
+# ──────────────────────────────────────
+# Marketplace Operations
+# ──────────────────────────────────────
+
+def create_work_request(db: Session, request_data: dict) -> WorkRequest:
+    new_request = WorkRequest(
+        requester_id=request_data['requester_id'],
+        title=request_data['title'],
+        description=request_data['description'],
+        required_capabilities=request_data.get('required_capabilities', []),
+        parent_workflow_id=request_data.get('parent_workflow_id'),
+        status="open"
+    )
+    db.add(new_request)
+    db.commit()
+    db.refresh(new_request)
+    return new_request
+
+
+def get_work_request_by_id(db: Session, request_id: int) -> WorkRequest | None:
+    return db.query(WorkRequest).filter(WorkRequest.id == request_id).first()
+
+
+def get_all_work_requests(db: Session) -> list[WorkRequest]:
+    return (
+        db.query(WorkRequest)
+        .order_by(WorkRequest.created_at.desc())
+        .all()
+    )
+
+
+def get_open_work_requests(db: Session) -> list[WorkRequest]:
+    return (
+        db.query(WorkRequest)
+        .filter(WorkRequest.status == "open")
+        .order_by(WorkRequest.created_at.desc())
+        .all()
+    )
+
+
+def create_volunteer(db: Session, volunteer_data: dict) -> Volunteer:
+    new_volunteer = Volunteer(
+        request_id=volunteer_data['request_id'],
+        user_id=volunteer_data['user_id'],
+        note=volunteer_data.get('note'),
+        status="pending"
+    )
+    db.add(new_volunteer)
+    db.commit()
+    db.refresh(new_volunteer)
+    return new_volunteer
+
+
+def get_volunteer_by_id(db: Session, volunteer_id: int) -> Volunteer | None:
+    return db.query(Volunteer).filter(Volunteer.id == volunteer_id).first()
+
+
+def update_volunteer_status(db: Session, volunteer_id: int, status: str) -> Volunteer | None:
+    volunteer = get_volunteer_by_id(db, volunteer_id)
+    if volunteer:
+        volunteer.status = status
+        db.commit()
+        db.refresh(volunteer)
+    return volunteer

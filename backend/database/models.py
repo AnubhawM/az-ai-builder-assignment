@@ -17,6 +17,7 @@ class User(Base):
     email = Column(String, unique=True, index=True, nullable=False)
     role = Column(String, nullable=False, default="researcher")
     slack_user_id = Column(String, nullable=True)
+    is_agent = Column(Boolean, default=False)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -35,6 +36,7 @@ class User(Base):
             "email": self.email,
             "role": self.role,
             "slack_user_id": self.slack_user_id,
+            "is_agent": self.is_agent,
             "is_active": self.is_active,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
@@ -55,11 +57,13 @@ class Workflow(Base):
     # Status values: pending, researching, awaiting_review, refining,
     #                generating_ppt, awaiting_presentation_review, completed, failed
     openclaw_session_id = Column(String, nullable=True)
+    parent_id = Column(Integer, ForeignKey("workflows.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     # Relationships
     owner = relationship("User", back_populates="workflows", foreign_keys=[user_id])
+    parent = relationship("Workflow", remote_side=[id], backref="sub_workflows")
     steps = relationship("WorkflowStep", back_populates="workflow", order_by="WorkflowStep.step_order",
                          cascade="all, delete-orphan")
     events = relationship("WorkflowEvent", back_populates="workflow", order_by="WorkflowEvent.created_at",
@@ -76,6 +80,7 @@ class Workflow(Base):
             "title": self.title,
             "status": self.status,
             "openclaw_session_id": self.openclaw_session_id,
+            "parent_id": self.parent_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "owner": self.owner.to_dict() if self.owner else None,
@@ -179,4 +184,70 @@ class WorkflowEvent(Base):
             "metadata_json": self.metadata_json,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "actor": self.actor.to_dict() if self.actor else None,
+        }
+
+
+class WorkRequest(Base):
+    """
+    Marketplace board entry for a new task or sub-task.
+    Enables discovery and volunteering before a workflow is officially created.
+    """
+    __tablename__ = "work_requests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    requester_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    title = Column(String, nullable=False)
+    description = Column(Text, nullable=False)
+    required_capabilities = Column(JSON, nullable=True)  # List of tags like ["research", "compliance"]
+    status = Column(String, nullable=False, default="open")  # open, assigned, completed
+    parent_workflow_id = Column(Integer, ForeignKey("workflows.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # Relationships
+    requester = relationship("User", foreign_keys=[requester_id])
+    volunteers = relationship("Volunteer", back_populates="request", cascade="all, delete-orphan")
+    workflow = relationship("Workflow", backref="origin_request", uselist=False)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "requester_id": self.requester_id,
+            "title": self.title,
+            "description": self.description,
+            "required_capabilities": self.required_capabilities or [],
+            "status": self.status,
+            "parent_workflow_id": self.parent_workflow_id,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "requester": self.requester.to_dict() if self.requester else None,
+            "volunteers": [v.to_dict() for v in self.volunteers] if self.volunteers else []
+        }
+
+
+class Volunteer(Base):
+    """
+    Bids/claims for a work request. 
+    Links users (humans/agents) to work requests they want to work on.
+    """
+    __tablename__ = "volunteers"
+
+    id = Column(Integer, primary_key=True, index=True)
+    request_id = Column(Integer, ForeignKey("work_requests.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    note = Column(Text, nullable=True)  # Optional "Why I'm a good match"
+    status = Column(String, nullable=False, default="pending")  # pending, accepted, rejected
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # Relationships
+    request = relationship("WorkRequest", back_populates="volunteers")
+    user = relationship("User", foreign_keys=[user_id])
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "request_id": self.request_id,
+            "user_id": self.user_id,
+            "note": self.note,
+            "status": self.status,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "user": self.user.to_dict() if self.user else None,
         }
