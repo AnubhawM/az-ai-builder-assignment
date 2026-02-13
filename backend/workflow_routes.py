@@ -192,24 +192,16 @@ def list_workflows():
     List workflows. Supports filtering by user.
 
     Query params:
-        - user_id: Filter to workflows owned by this user
-        - assigned_to: Filter to workflows with steps assigned to this user
-        - all: If true, return all workflows (for dashboard)
+        - user_id: Required. Returns workflows where this user is a participant.
     """
     db = SessionLocal()
     try:
         user_id = request.args.get("user_id", type=int)
-        assigned_to = request.args.get("assigned_to", type=int)
-        show_all = request.args.get("all", "false").lower() == "true"
+        if not user_id:
+            return jsonify({"error": "user_id is required"}), 400
 
-        if show_all:
-            workflows = get_all_workflows(db)
-        elif assigned_to:
-            workflows = get_workflows_assigned_to_user(db, assigned_to)
-        elif user_id:
-            workflows = get_workflows_by_user(db, user_id)
-        else:
-            workflows = get_all_workflows(db)
+        workflows = get_all_workflows(db)
+        workflows = [w for w in workflows if user_id in _participant_user_ids(w)]
 
         workflow_payload = []
         for workflow in workflows:
@@ -231,9 +223,15 @@ def get_workflow_detail(workflow_id):
     """Get the full detail of a workflow including steps, events, and content."""
     db = SessionLocal()
     try:
+        user_id = request.args.get("user_id", type=int)
+        if not user_id:
+            return jsonify({"error": "user_id is required"}), 400
+
         workflow = get_workflow_by_id(db, workflow_id)
         if not workflow:
             return jsonify({"error": "Workflow not found"}), 404
+        if user_id not in _participant_user_ids(workflow):
+            return jsonify({"error": "User is not a participant in this workflow"}), 403
 
         return jsonify({
             "workflow": workflow.to_dict()
@@ -291,26 +289,27 @@ def submit_review(workflow_id):
         user = get_user_by_id(db, user_id)
         if not user:
             return jsonify({"error": "User not found"}), 404
+        if user_id not in _participant_user_ids(workflow):
+            return jsonify({"error": "User is not a participant in this workflow"}), 403
 
         # Find the research step to get the accumulated research
         research_step = None
+        review_step = None
         for step in workflow.steps:
             if step.step_type == "agent_research":
                 research_step = step
-                break
+            if step.step_type == "human_review":
+                review_step = step
 
         if not research_step or not research_step.output_data:
             return jsonify({"error": "No research data found"}), 400
+        if review_step and review_step.assigned_to and review_step.assigned_to != user_id:
+            return jsonify({"error": "Only the assigned reviewer can submit this review"}), 403
 
         if action == "approve":
             # ── APPROVE: Mark review as done, start PPT generation ──
 
             # Update the review step
-            review_step = None
-            for step in workflow.steps:
-                if step.step_type == "human_review":
-                    review_step = step
-                    break
             if review_step:
                 update_step_status(db, review_step.id, "completed")
 
@@ -376,7 +375,9 @@ def list_workflow_messages(workflow_id):
             return jsonify({"error": "Workflow not found"}), 404
 
         user_id = request.args.get("user_id", type=int)
-        if user_id and user_id not in _participant_user_ids(workflow):
+        if not user_id:
+            return jsonify({"error": "user_id is required"}), 400
+        if user_id not in _participant_user_ids(workflow):
             return jsonify({"error": "User is not a participant in this workflow"}), 403
 
         messages = get_messages_for_workflow(db, workflow_id)
@@ -507,8 +508,19 @@ def update_workflow_completion(workflow_id):
             len(human_participant_ids) >= 2
             and all(approval_by_user.get(pid) == "ready" for pid in human_participant_ids)
         )
+        linked_request_id = None
+        for step in workflow.steps:
+            payload = step.input_data or {}
+            if isinstance(payload, dict) and payload.get("request_id"):
+                linked_request_id = payload.get("request_id")
+                break
 
         if all_humans_ready:
+            if linked_request_id:
+                linked_request = get_work_request_by_id(db, linked_request_id)
+                if linked_request and linked_request.status != "completed":
+                    linked_request.status = "completed"
+
             update_workflow_status(db, workflow_id, "completed")
             active_step = get_active_step(db, workflow_id)
             if active_step:
@@ -526,12 +538,115 @@ def update_workflow_completion(workflow_id):
                 message="Collaboration approved by all human participants"
             )
         else:
+            if linked_request_id:
+                linked_request = get_work_request_by_id(db, linked_request_id)
+                if linked_request and linked_request.status == "completed":
+                    linked_request.status = "assigned"
             update_workflow_status(db, workflow_id, "collaborating")
 
         return jsonify({
             "message": "Completion state updated",
             "workflow": get_workflow_by_id(db, workflow_id).to_dict()
         }), 200
+    finally:
+        db.close()
+
+
+@workflow_bp.route('/api/workflows/<int:workflow_id>/start-research', methods=['POST'])
+def start_research_from_collaboration(workflow_id):
+    """
+    Manually start OpenClaw research after requester approval in collaboration chat.
+    """
+    db = SessionLocal()
+    try:
+        data = request.json or {}
+        user_id = data.get("user_id")
+
+        if not user_id:
+            return jsonify({"error": "user_id is required"}), 400
+
+        workflow = get_workflow_by_id(db, workflow_id)
+        if not workflow:
+            return jsonify({"error": "Workflow not found"}), 404
+        if user_id not in _participant_user_ids(workflow):
+            return jsonify({"error": "User is not a participant in this workflow"}), 403
+        if user_id != workflow.user_id:
+            return jsonify({"error": "Only the requester can start research"}), 403
+        if workflow.status != "collaborating":
+            return jsonify({"error": f"Workflow is not in collaborating state (current: {workflow.status})"}), 400
+        if not _has_agent_participant(workflow):
+            return jsonify({"error": "No agent collaborator is assigned to this workflow"}), 400
+
+        for step in workflow.steps:
+            if step.step_type == "agent_research" and step.status in ("pending", "in_progress", "awaiting_input", "completed"):
+                return jsonify({"error": "Research has already started for this workflow"}), 400
+
+        active_step = get_active_step(db, workflow_id)
+        request_description = ""
+        if active_step and isinstance(active_step.input_data, dict):
+            request_description = (active_step.input_data.get("description") or "").strip()
+            if active_step.status in ("pending", "in_progress", "awaiting_input"):
+                update_step_status(db, active_step.id, "completed")
+
+        recent_messages = workflow.messages[-12:] if workflow.messages else []
+        context_lines = []
+        for msg in recent_messages:
+            if msg.sender_type == "system":
+                speaker = "System"
+            elif msg.sender and msg.sender.name:
+                speaker = msg.sender.name
+            elif msg.sender_type == "agent":
+                speaker = "OpenClaw"
+            else:
+                speaker = "Human"
+            context_lines.append(f"{speaker}: {msg.message}")
+        chat_context = "\n".join(context_lines)
+        if chat_context:
+            request_description = "\n\n".join(
+                part for part in [request_description, f"Collaboration context:\n{chat_context}"] if part
+            )
+
+        session_id = workflow.openclaw_session_id or f"workflow-{generate_session_id()}"
+        if not workflow.openclaw_session_id:
+            update_workflow_status(db, workflow_id, workflow.status, openclaw_session_id=session_id)
+
+        next_step_order = max((s.step_order for s in workflow.steps), default=0) + 1
+        create_workflow_step(
+            db,
+            workflow_id=workflow_id,
+            step_order=next_step_order,
+            step_type="agent_research",
+            provider_type="agent",
+            input_data={
+                "topic": workflow.title,
+                "description": request_description
+            }
+        )
+
+        create_workflow_message(
+            db,
+            workflow_id=workflow_id,
+            sender_type="system",
+            channel="system",
+            message="Requester approved the plan. OpenClaw research is starting now."
+        )
+        create_event(
+            db, workflow_id=workflow_id, event_type="research_started",
+            actor_id=user_id, actor_type="human", channel="web",
+            message="Requester approved and started agent research from collaboration chat"
+        )
+
+        start_research(
+            workflow_id,
+            workflow.title,
+            session_id,
+            request_description=request_description
+        )
+
+        return jsonify({
+            "message": "Research started from collaboration workflow.",
+            "workflow": get_workflow_by_id(db, workflow_id).to_dict()
+        }), 202
     finally:
         db.close()
 
@@ -886,6 +1001,8 @@ def accept_volunteer(request_id):
 
         if not volunteer_id:
             return jsonify({"error": "volunteer_id is required"}), 400
+        if not requester_id:
+            return jsonify({"error": "user_id is required"}), 400
 
         work_request = get_work_request_by_id(db, request_id)
         volunteer = get_volunteer_by_id(db, volunteer_id)
@@ -898,7 +1015,7 @@ def accept_volunteer(request_id):
             return jsonify({"error": f"Request is already {work_request.status}"}), 400
         if volunteer.status != "pending":
             return jsonify({"error": f"Volunteer is already {volunteer.status}"}), 400
-        if requester_id and requester_id != work_request.requester_id:
+        if requester_id != work_request.requester_id:
             return jsonify({"error": "Only the requester can accept a volunteer"}), 403
 
         # 1. Update statuses
@@ -916,7 +1033,8 @@ def accept_volunteer(request_id):
             work_request.description,
             work_request.required_capabilities
         )
-        auto_start_agent = user.is_agent and _should_auto_start_agent(work_request.required_capabilities)
+        requires_research = user.is_agent and _should_auto_start_agent(work_request.required_capabilities)
+        auto_start_agent = False
 
         workflow = create_workflow(
             db,
@@ -929,7 +1047,7 @@ def accept_volunteer(request_id):
 
         # 3. Create the first step and assign it
         if user.is_agent:
-            step_type = "agent_research" if auto_start_agent else "agent_collaboration"
+            step_type = "agent_collaboration"
         elif workflow_type in ("compliance_review", "design_alignment"):
             step_type = "specialist_review"
         else:
@@ -943,7 +1061,9 @@ def accept_volunteer(request_id):
             input_data={
                 "topic": work_request.title,
                 "description": work_request.description,
-                "workflow_type": workflow_type
+                "workflow_type": workflow_type,
+                "request_id": work_request.id,
+                "requires_research": requires_research
             }
         )
 
@@ -968,19 +1088,21 @@ def accept_volunteer(request_id):
                     "Use this chat to collaborate, refine, and confirm completion."
                 )
             )
+            if requires_research:
+                create_workflow_message(
+                    db,
+                    workflow_id=workflow.id,
+                    sender_type="system",
+                    channel="system",
+                    message=(
+                        "Research has not started yet. Let the agent propose a first-step plan in chat, "
+                        "then requester uses 'Start Agent Research' when ready."
+                    )
+                )
 
         if not user.is_agent:
             upsert_workflow_approval(db, workflow.id, work_request.requester_id, "pending")
             upsert_workflow_approval(db, workflow.id, user.id, "pending")
-
-        # 6. If it's an auto-start agent workflow, trigger service logic immediately
-        if auto_start_agent and user.email == "agent@openclaw.ai":
-            start_research(
-                workflow.id,
-                work_request.title,
-                session_id,
-                request_description=work_request.description or ""
-            )
 
         db.commit()
         return jsonify({
@@ -1011,6 +1133,7 @@ def accept_volunteer(request_id):
 @workflow_bp.route('/api/workflows/<int:workflow_id>/review', methods=['OPTIONS'])
 @workflow_bp.route('/api/workflows/<int:workflow_id>/messages', methods=['OPTIONS'])
 @workflow_bp.route('/api/workflows/<int:workflow_id>/completion', methods=['OPTIONS'])
+@workflow_bp.route('/api/workflows/<int:workflow_id>/start-research', methods=['OPTIONS'])
 @workflow_bp.route('/api/workflows/<int:workflow_id>/generate-ppt', methods=['OPTIONS'])
 @workflow_bp.route('/api/slack/interactions', methods=['OPTIONS'])
 def handle_workflow_options(**kwargs):

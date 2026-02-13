@@ -46,7 +46,7 @@ const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSe
     const fetchWorkflows = useCallback(async () => {
         try {
             const res = await axios.get(`${import.meta.env.VITE_API_URL}/api/workflows`, {
-                params: { all: 'true' }
+                params: { user_id: currentUser.id }
             });
             setWorkflows(res.data.workflows);
         } catch (err) {
@@ -54,7 +54,7 @@ const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSe
         } finally {
             setLoading(false);
         }
-    }, []);
+    }, [currentUser.id]);
 
     useEffect(() => {
         fetchWorkflows();

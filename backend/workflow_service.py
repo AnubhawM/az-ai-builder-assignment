@@ -19,7 +19,7 @@ from crud import (
     create_workflow_step, get_active_step,
     update_step_status, increment_step_iteration,
     create_event, create_workflow_message,
-    get_user_by_email
+    get_user_by_email, get_work_request_by_id
 )
 from openclaw_client import ask_openclaw, generate_session_id
 from openclaw_webhook_client import trigger_agent
@@ -690,6 +690,18 @@ Use a descriptive filename based on the topic."""
                                     "file_size_formatted": f"{file_size / 1024:.1f} KB",
                                 }
                             )
+
+                            linked_request_id = None
+                            for step in workflow.steps:
+                                payload = step.input_data or {}
+                                if isinstance(payload, dict) and payload.get("request_id"):
+                                    linked_request_id = payload.get("request_id")
+                                    break
+                            if linked_request_id:
+                                linked_request = get_work_request_by_id(db, linked_request_id)
+                                if linked_request and linked_request.status != "completed":
+                                    linked_request.status = "completed"
+
                             update_workflow_status(db, workflow_id, "completed")
                             create_event(
                                 db, workflow_id=workflow_id,

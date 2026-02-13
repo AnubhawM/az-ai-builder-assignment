@@ -55,6 +55,7 @@ interface WorkflowApproval {
 
 interface Workflow {
     id: number;
+    user_id: number;
     title: string;
     status: string;
     workflow_type: string;
@@ -130,6 +131,7 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
     const [submitting, setSubmitting] = useState(false);
     const [sendingMessage, setSendingMessage] = useState(false);
     const [updatingCompletion, setUpdatingCompletion] = useState(false);
+    const [triggeringResearch, setTriggeringResearch] = useState(false);
     const [triggeringGeneration, setTriggeringGeneration] = useState(false);
     const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({
         summary: true,
@@ -139,14 +141,16 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
 
     const fetchWorkflow = useCallback(async () => {
         try {
-            const res = await axios.get(`${import.meta.env.VITE_API_URL}/api/workflows/${workflowId}`);
+            const res = await axios.get(`${import.meta.env.VITE_API_URL}/api/workflows/${workflowId}`, {
+                params: { user_id: currentUser.id }
+            });
             setWorkflow(res.data.workflow);
         } catch (err) {
             console.error('Failed to fetch workflow:', err);
         } finally {
             setLoading(false);
         }
-    }, [workflowId]);
+    }, [workflowId, currentUser.id]);
 
     useEffect(() => {
         fetchWorkflow();
@@ -211,6 +215,22 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
             alert(err.response?.data?.error || 'Failed to update completion state');
         } finally {
             setUpdatingCompletion(false);
+        }
+    };
+
+    const handleStartResearch = async () => {
+        if (triggeringResearch) return;
+        setTriggeringResearch(true);
+        try {
+            await axios.post(`${import.meta.env.VITE_API_URL}/api/workflows/${workflowId}/start-research`, {
+                user_id: currentUser.id
+            });
+            fetchWorkflow();
+        } catch (err: any) {
+            console.error('Failed to start research from collaboration:', err);
+            alert(err.response?.data?.error || 'Failed to start research');
+        } finally {
+            setTriggeringResearch(false);
         }
     };
 
@@ -284,6 +304,14 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
     const hasAgentParticipant = workflow.steps.some(
         s => s.assignee?.is_agent || s.provider_type === 'agent'
     );
+    const requiresResearch = workflow.steps.some(
+        s => Boolean(s.input_data?.requires_research)
+    );
+    const canStartResearch = workflow.status === 'collaborating'
+        && hasAgentParticipant
+        && requiresResearch
+        && !researchStep
+        && currentUser.id === workflow.user_id;
 
     const humanApprovals = workflow.approvals.filter(a => !a.user?.is_agent);
     const currentApproval = humanApprovals.find(a => a.user_id === currentUser.id);
@@ -564,6 +592,16 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                                 {sendingMessage ? 'Sending...' : 'Send'}
                             </button>
                         </div>
+
+                        {canStartResearch && (
+                            <button
+                                onClick={handleStartResearch}
+                                disabled={triggeringResearch || workflow.status === 'generating_ppt'}
+                                className="btn btn-success mt-3 w-full"
+                            >
+                                {triggeringResearch ? 'Starting...' : 'Start Agent Research'}
+                            </button>
+                        )}
 
                         {hasAgentParticipant && (
                             <button
