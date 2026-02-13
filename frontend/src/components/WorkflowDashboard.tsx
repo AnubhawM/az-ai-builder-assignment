@@ -27,6 +27,7 @@ interface WorkflowDashboardProps {
 
 const statusConfig: Record<string, { label: string; badge: string; icon: string }> = {
     pending: { label: 'Pending', badge: 'badge-pending', icon: '⏳' },
+    collaborating: { label: 'Collaborating', badge: 'badge-active', icon: '💬' },
     researching: { label: 'Research In Progress', badge: 'badge-active', icon: '🔍' },
     refining: { label: 'Refining Research', badge: 'badge-active', icon: '🔄' },
     awaiting_review: { label: 'Awaiting Review', badge: 'badge-review', icon: '👁️' },

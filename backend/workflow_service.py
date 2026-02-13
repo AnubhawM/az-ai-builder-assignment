@@ -18,9 +18,10 @@ from crud import (
     get_workflow_by_id, update_workflow_status,
     create_workflow_step, get_active_step,
     update_step_status, increment_step_iteration,
-    create_event
+    create_event, create_workflow_message,
+    get_user_by_email
 )
-from openclaw_client import ask_openclaw
+from openclaw_client import ask_openclaw, generate_session_id
 from openclaw_webhook_client import trigger_agent
 
 # PPT output directory (shared with existing PPT generation logic)
@@ -30,6 +31,65 @@ PPT_OUTPUT_DIR = "/Users/anubhawmathur/development/ppt-output"
 # ──────────────────────────────────────
 # Research Output Parsing
 # ──────────────────────────────────────
+
+SECTION_HEADER_VARIANTS = (
+    r"EXECUTIVE\s+SUMMARY",
+    r"SLIDE(?:\s*[-/]?\s*BY\s*[-/]?\s*SLIDE)?\s+(?:OUTLINE|BREAKDOWN)",
+    r"RAW\s+RESEARCH(?:\s+DATA)?",
+)
+SECTION_HEADER_ALT = "|".join(SECTION_HEADER_VARIANTS)
+SECTION_HEADER_PATTERN = re.compile(
+    r"^\s*(?:={3,}\s*)?(?P<header_a>" + SECTION_HEADER_ALT + r")(?:\s*={3,})?\s*:?\s*$"
+    r"|^\s*#{1,6}\s*(?P<header_b>" + SECTION_HEADER_ALT + r")\s*:?\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _canonicalize_header_label(header_text: str) -> str | None:
+    token = re.sub(r"[^a-z]+", " ", header_text.lower()).strip()
+    if "executive" in token and "summary" in token:
+        return "summary"
+    if "slide" in token and ("outline" in token or "breakdown" in token):
+        return "slide_outline"
+    if "raw" in token and "research" in token:
+        return "raw_research"
+    return None
+
+
+def _extract_section_map(normalized_text: str) -> dict:
+    section_map = {
+        "summary": "",
+        "slide_outline": "",
+        "raw_research": "",
+    }
+    matches = list(SECTION_HEADER_PATTERN.finditer(normalized_text))
+    if not matches:
+        return section_map
+
+    for idx, match in enumerate(matches):
+        header = match.group("header_a") or match.group("header_b") or ""
+        key = _canonicalize_header_label(header)
+        if not key:
+            continue
+
+        start = match.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(normalized_text)
+        chunk = normalized_text[start:end].strip()
+
+        if not chunk:
+            continue
+
+        # If the model nested another recognizable heading inside a chunk,
+        # keep only content up to that heading boundary.
+        nested = SECTION_HEADER_PATTERN.search(chunk)
+        if nested:
+            chunk = chunk[:nested.start()].strip()
+
+        if chunk and not section_map[key]:
+            section_map[key] = chunk
+
+    return section_map
+
 
 def parse_research_output(raw_text: str) -> dict:
     """
@@ -48,32 +108,22 @@ def parse_research_output(raw_text: str) -> dict:
     if not raw_text:
         return result
 
-    # Try to extract sections using markers
-    summary_pattern = r"===\s*EXECUTIVE\s*SUMMARY\s*===\s*\n(.*?)(?=\n===|\Z)"
-    outline_pattern = r"===\s*SLIDE\s*OUTLINE\s*===\s*\n(.*?)(?=\n===|\Z)"
-    research_pattern = r"===\s*RAW\s*RESEARCH\s*===\s*\n(.*?)(?=\n===|\Z)"
-
-    summary_match = re.search(summary_pattern, raw_text, re.DOTALL | re.IGNORECASE)
-    outline_match = re.search(outline_pattern, raw_text, re.DOTALL | re.IGNORECASE)
-    research_match = re.search(research_pattern, raw_text, re.DOTALL | re.IGNORECASE)
-
-    if summary_match:
-        result["summary"] = summary_match.group(1).strip()
-    if outline_match:
-        result["slide_outline"] = outline_match.group(1).strip()
-    if research_match:
-        result["raw_research"] = research_match.group(1).strip()
+    normalized_text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+    extracted = _extract_section_map(normalized_text)
+    result["summary"] = extracted["summary"]
+    result["slide_outline"] = extracted["slide_outline"]
+    result["raw_research"] = extracted["raw_research"]
 
     # Fallback: if no sections were found, use the entire text
     if not result["summary"] and not result["slide_outline"]:
         # Try to create a summary from the first few paragraphs
-        paragraphs = [p.strip() for p in raw_text.split("\n\n") if p.strip()]
+        paragraphs = [p.strip() for p in normalized_text.split("\n\n") if p.strip()]
         if len(paragraphs) >= 2:
             result["summary"] = "\n\n".join(paragraphs[:2])
-            result["raw_research"] = raw_text
+            result["raw_research"] = normalized_text
         else:
-            result["summary"] = raw_text[:500] + ("..." if len(raw_text) > 500 else "")
-            result["raw_research"] = raw_text
+            result["summary"] = normalized_text[:500] + ("..." if len(normalized_text) > 500 else "")
+            result["raw_research"] = normalized_text
 
     return result
 
@@ -82,11 +132,21 @@ def parse_research_output(raw_text: str) -> dict:
 # Research Pipeline
 # ──────────────────────────────────────
 
-def _build_research_prompt(topic: str, num_slides: int = 8) -> str:
+def _build_research_prompt(topic: str, num_slides: int = 8, request_description: str = "") -> str:
     """Build the structured research prompt for OpenClaw."""
+    description_block = ""
+    if request_description and request_description.strip():
+        description_block = f"""
+ADDITIONAL REQUEST CONTEXT:
+{request_description.strip()}
+
+Use both the topic and this context when selecting what to research, which facts to prioritize, and how to structure the final slides.
+"""
+
     return f"""You are a research assistant for the AIXplore Capability Exchange.
 
 TASK: Research the following topic thoroughly using web_search: "{topic}"
+{description_block}
 
 After completing your research, return your findings in this EXACT format (use the section headers exactly as shown):
 
@@ -139,21 +199,21 @@ INSTRUCTIONS:
 Make sure to incorporate the reviewer's feedback while preserving the valuable parts of your original research."""
 
 
-def start_research(workflow_id: int, topic: str, openclaw_session_id: str):
+def start_research(workflow_id: int, topic: str, openclaw_session_id: str, request_description: str = ""):
     """
     Launch a background thread to run OpenClaw research.
     Updates the database with results when complete.
     """
     thread = threading.Thread(
         target=_run_research_thread,
-        args=(workflow_id, topic, openclaw_session_id),
+        args=(workflow_id, topic, openclaw_session_id, request_description),
         daemon=True
     )
     thread.start()
     return thread
 
 
-def _run_research_thread(workflow_id: int, topic: str, openclaw_session_id: str):
+def _run_research_thread(workflow_id: int, topic: str, openclaw_session_id: str, request_description: str = ""):
     """Background thread: executes OpenClaw research and updates DB."""
     db = SessionLocal()
     try:
@@ -175,7 +235,7 @@ def _run_research_thread(workflow_id: int, topic: str, openclaw_session_id: str)
         )
 
         # Build prompt and call OpenClaw (synchronous — blocks this thread)
-        prompt = _build_research_prompt(topic)
+        prompt = _build_research_prompt(topic, request_description=request_description)
         print(f"[Workflow {workflow_id}] Starting OpenClaw research...")
 
         result = ask_openclaw(
@@ -380,6 +440,130 @@ def _run_refinement_thread(workflow_id: int, feedback: str, openclaw_session_id:
 
 
 # ──────────────────────────────────────
+# Agent Chat Loop (Phase 1.5)
+# ──────────────────────────────────────
+
+def _build_agent_chat_prompt(
+    workflow_title: str,
+    workflow_type: str,
+    latest_user_message: str,
+    recent_chat_context: str
+) -> str:
+    return f"""You are OpenClaw, collaborating inside the AIXplore Capability Exchange.
+
+WORKFLOW TITLE: {workflow_title}
+WORKFLOW TYPE: {workflow_type}
+
+RECENT CHAT CONTEXT:
+{recent_chat_context}
+
+LATEST HUMAN MESSAGE:
+{latest_user_message}
+
+INSTRUCTIONS:
+1. Reply as a practical collaborator in 1-4 short paragraphs.
+2. If asked for revisions, return actionable edits and checks.
+3. If the request is about presentation quality, include concrete guidance for SlideSpeak/PPT updates.
+4. If information is missing, ask concise clarifying questions.
+5. Do not mention internal tooling or hidden reasoning.
+"""
+
+
+def start_agent_chat_reply(workflow_id: int, latest_user_message: str):
+    """Launch a background reply from OpenClaw for workflow chat."""
+    thread = threading.Thread(
+        target=_run_agent_chat_reply_thread,
+        args=(workflow_id, latest_user_message),
+        daemon=True
+    )
+    thread.start()
+    return thread
+
+
+def _run_agent_chat_reply_thread(workflow_id: int, latest_user_message: str):
+    """Background thread: get OpenClaw reply and persist it as a workflow chat message."""
+    db = SessionLocal()
+    try:
+        workflow = get_workflow_by_id(db, workflow_id)
+        if not workflow:
+            return
+
+        # Ensure a session exists so OpenClaw can maintain collaboration context.
+        session_id = workflow.openclaw_session_id
+        if not session_id:
+            session_id = f"workflow-{generate_session_id()}"
+            update_workflow_status(db, workflow_id, workflow.status, openclaw_session_id=session_id)
+
+        recent_messages = workflow.messages[-10:] if workflow.messages else []
+        context_lines = []
+        for msg in recent_messages:
+            if msg.sender_type == "system":
+                speaker = "System"
+            elif msg.sender and msg.sender.name:
+                speaker = msg.sender.name
+            elif msg.sender_type == "agent":
+                speaker = "OpenClaw"
+            else:
+                speaker = "Human"
+            context_lines.append(f"{speaker}: {msg.message}")
+
+        recent_chat_context = "\n".join(context_lines) if context_lines else "No prior chat context."
+        prompt = _build_agent_chat_prompt(
+            workflow_title=workflow.title,
+            workflow_type=workflow.workflow_type,
+            latest_user_message=latest_user_message,
+            recent_chat_context=recent_chat_context
+        )
+
+        result = ask_openclaw(
+            message=prompt,
+            session_id=session_id,
+            timeout=180
+        )
+
+        openclaw_user = get_user_by_email(db, "agent@openclaw.ai")
+        if result.get("success"):
+            reply = (result.get("output") or "").strip()
+            if reply:
+                create_workflow_message(
+                    db,
+                    workflow_id=workflow_id,
+                    message=reply,
+                    sender_id=openclaw_user.id if openclaw_user else None,
+                    sender_type="agent",
+                    channel="web"
+                )
+                create_event(
+                    db, workflow_id=workflow_id, event_type="agent_replied",
+                    actor_id=openclaw_user.id if openclaw_user else None,
+                    actor_type="agent", channel="web",
+                    message="OpenClaw responded in workflow chat"
+                )
+        else:
+            error_msg = result.get("error", "Unknown agent error")
+            create_workflow_message(
+                db,
+                workflow_id=workflow_id,
+                message=f"OpenClaw could not respond right now: {error_msg}",
+                sender_id=openclaw_user.id if openclaw_user else None,
+                sender_type="agent",
+                channel="system"
+            )
+            create_event(
+                db, workflow_id=workflow_id, event_type="failed",
+                actor_type="agent", channel="web",
+                message=f"Agent chat reply failed: {error_msg}"
+            )
+
+    except Exception as e:
+        print(f"[Workflow {workflow_id}] EXCEPTION in agent chat thread: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        db.close()
+
+
+# ──────────────────────────────────────
 # PPT Generation Pipeline
 # ──────────────────────────────────────
 
@@ -404,9 +588,10 @@ def _run_ppt_generation_thread(workflow_id: int, research_text: str, topic: str)
         workflow = get_workflow_by_id(db, workflow_id)
 
         # Create the generation step
+        next_step_order = max((s.step_order for s in workflow.steps), default=0) + 1
         gen_step = create_workflow_step(
             db, workflow_id=workflow_id,
-            step_order=3,
+            step_order=next_step_order,
             step_type="agent_generation",
             provider_type="agent",
             input_data={"topic": topic, "research_preview": research_text[:500]}

@@ -1,4 +1,3 @@
-// src/components/WorkflowDetail.tsx
 import React, { useEffect, useState, useCallback } from 'react';
 import axios from 'axios';
 
@@ -7,6 +6,7 @@ interface User {
     name: string;
     role: string;
     email: string;
+    is_agent?: boolean;
 }
 
 interface WorkflowStep {
@@ -16,7 +16,7 @@ interface WorkflowStep {
     status: string;
     provider_type: string;
     assigned_to: number | null;
-    assignee: { name: string; role: string } | null;
+    assignee: User | null;
     input_data: Record<string, any> | null;
     output_data: Record<string, any> | null;
     feedback: string | null;
@@ -30,10 +30,27 @@ interface WorkflowEvent {
     event_type: string;
     actor_type: string;
     actor_id: number | null;
-    actor: { name: string; role: string } | null;
+    actor: User | null;
     channel: string | null;
     message: string | null;
     created_at: string;
+}
+
+interface WorkflowMessage {
+    id: number;
+    sender_id: number | null;
+    sender_type: string;
+    channel: string;
+    message: string;
+    created_at: string;
+    sender: User | null;
+}
+
+interface WorkflowApproval {
+    id: number;
+    user_id: number;
+    status: 'pending' | 'ready' | 'approved';
+    user: User | null;
 }
 
 interface Workflow {
@@ -42,9 +59,11 @@ interface Workflow {
     status: string;
     workflow_type: string;
     openclaw_session_id: string | null;
-    owner: { name: string; role: string } | null;
+    owner: User | null;
     steps: WorkflowStep[];
     events: WorkflowEvent[];
+    messages: WorkflowMessage[];
+    approvals: WorkflowApproval[];
     created_at: string;
     updated_at: string;
 }
@@ -58,6 +77,9 @@ interface WorkflowDetailProps {
 const stepTypeLabels: Record<string, { label: string; icon: string }> = {
     agent_research: { label: 'Research', icon: '🔬' },
     human_review: { label: 'Review', icon: '👁️' },
+    specialist_review: { label: 'Specialist', icon: '🧠' },
+    human_research: { label: 'Human Work', icon: '🧾' },
+    agent_collaboration: { label: 'Agent Collab', icon: '🤖' },
     agent_generation: { label: 'Generate', icon: '📊' },
     presentation_review: { label: 'PPT Review', icon: '🎨' },
 };
@@ -78,17 +100,37 @@ const eventIcons: Record<string, string> = {
     review_requested: '📋',
     approved: '👍',
     refined: '🔄',
+    generation_requested: '📝',
     generation_started: '⚙️',
     generation_completed: '🎉',
+    message_posted: '💬',
+    completion_marked: '✅',
+    reopened: '↩️',
+    agent_replied: '🤖',
     notification_sent: '📨',
     failed: '❌',
+};
+
+const workflowStatusLabel: Record<string, string> = {
+    pending: 'Pending',
+    researching: 'Researching',
+    refining: 'Refining',
+    awaiting_review: 'Awaiting Review',
+    generating_ppt: 'Generating PPT',
+    collaborating: 'Collaborating',
+    completed: 'Completed',
+    failed: 'Failed',
 };
 
 const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser, onBack }) => {
     const [workflow, setWorkflow] = useState<Workflow | null>(null);
     const [loading, setLoading] = useState(true);
     const [feedback, setFeedback] = useState('');
+    const [chatInput, setChatInput] = useState('');
     const [submitting, setSubmitting] = useState(false);
+    const [sendingMessage, setSendingMessage] = useState(false);
+    const [updatingCompletion, setUpdatingCompletion] = useState(false);
+    const [triggeringGeneration, setTriggeringGeneration] = useState(false);
     const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({
         summary: true,
         outline: true,
@@ -134,6 +176,61 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
         }
     };
 
+    const handleSendMessage = async () => {
+        if (sendingMessage) return;
+        if (!chatInput.trim()) return;
+
+        setSendingMessage(true);
+        try {
+            await axios.post(`${import.meta.env.VITE_API_URL}/api/workflows/${workflowId}/messages`, {
+                user_id: currentUser.id,
+                message: chatInput.trim(),
+                channel: 'web'
+            });
+            setChatInput('');
+            fetchWorkflow();
+        } catch (err: any) {
+            console.error('Failed to send workflow message:', err);
+            alert(err.response?.data?.error || 'Failed to send message');
+        } finally {
+            setSendingMessage(false);
+        }
+    };
+
+    const handleCompletion = async (action: 'mark_ready' | 'reopen') => {
+        if (updatingCompletion) return;
+        setUpdatingCompletion(true);
+        try {
+            await axios.post(`${import.meta.env.VITE_API_URL}/api/workflows/${workflowId}/completion`, {
+                user_id: currentUser.id,
+                action
+            });
+            fetchWorkflow();
+        } catch (err: any) {
+            console.error('Failed to update completion state:', err);
+            alert(err.response?.data?.error || 'Failed to update completion state');
+        } finally {
+            setUpdatingCompletion(false);
+        }
+    };
+
+    const handleGenerateFromChat = async () => {
+        if (triggeringGeneration) return;
+        setTriggeringGeneration(true);
+        try {
+            await axios.post(`${import.meta.env.VITE_API_URL}/api/workflows/${workflowId}/generate-ppt`, {
+                user_id: currentUser.id,
+                instructions: chatInput.trim() || undefined
+            });
+            fetchWorkflow();
+        } catch (err: any) {
+            console.error('Failed to trigger generation from chat:', err);
+            alert(err.response?.data?.error || 'Failed to trigger PPT generation');
+        } finally {
+            setTriggeringGeneration(false);
+        }
+    };
+
     const toggleSection = (key: string) => {
         setExpandedSections(prev => ({ ...prev, [key]: !prev[key] }));
     };
@@ -161,24 +258,40 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
         );
     }
 
-    // Get the research step output
+    const orderedSteps = [...workflow.steps].sort((a, b) => a.step_order - b.step_order);
+    const pipelineSteps = orderedSteps.length > 0
+        ? orderedSteps.slice(0, 4).map((step) => {
+            const fallbackLabel = step.step_type.replace(/_/g, ' ');
+            const labelInfo = stepTypeLabels[step.step_type] || { label: fallbackLabel, icon: '📌' };
+            return {
+                key: `step-${step.id}`,
+                ...labelInfo,
+                step,
+            };
+        })
+        : [
+            { key: 'pending', label: 'Pending', icon: '⏳', step: null }
+        ];
+
     const researchStep = workflow.steps.find(s => s.step_type === 'agent_research');
     const researchOutput = researchStep?.output_data;
-    const generationStep = workflow.steps.find(s => s.step_type === 'agent_generation');
-
-    // Pipeline steps for the tracker
-    const pipelineSteps = [
-        { key: 'research', ...stepTypeLabels.agent_research, step: researchStep },
-        { key: 'review', ...stepTypeLabels.human_review, step: workflow.steps.find(s => s.step_type === 'human_review') },
-        { key: 'generate', ...stepTypeLabels.agent_generation, step: generationStep },
-    ];
+    const generationStep = workflow.steps
+        .filter(s => s.step_type === 'agent_generation')
+        .slice(-1)[0];
 
     const isAwaitingReview = workflow.status === 'awaiting_review';
     const isProcessing = ['researching', 'refining', 'generating_ppt', 'pending'].includes(workflow.status);
+    const hasAgentParticipant = workflow.steps.some(
+        s => s.assignee?.is_agent || s.provider_type === 'agent'
+    );
+
+    const humanApprovals = workflow.approvals.filter(a => !a.user?.is_agent);
+    const currentApproval = humanApprovals.find(a => a.user_id === currentUser.id);
+    const isCurrentUserReady = currentApproval?.status === 'ready' || currentApproval?.status === 'approved';
+    const canUseCompletion = humanApprovals.length >= 2 && humanApprovals.some(a => a.user_id === currentUser.id);
 
     return (
         <div className="max-w-6xl mx-auto px-6 py-8 animate-fade-in">
-            {/* Back button + title */}
             <div className="flex items-center gap-4 mb-6">
                 <button onClick={onBack} className="btn btn-ghost text-sm" id="back-btn">
                     ← Dashboard
@@ -187,6 +300,7 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                     <h2 className="text-xl font-bold text-white truncate">{workflow.title}</h2>
                     <p className="text-xs text-[var(--color-text-muted)] mt-0.5">
                         Created by {workflow.owner?.name} · {formatDate(workflow.created_at)}
+                        <span className="ml-2 text-purple-400">· {workflowStatusLabel[workflow.status] || workflow.status}</span>
                         {researchStep && researchStep.iteration_count > 0 && (
                             <span className="ml-2 text-purple-400">· Refinement round {researchStep.iteration_count}</span>
                         )}
@@ -194,7 +308,6 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                 </div>
             </div>
 
-            {/* ─── Pipeline Tracker ─── */}
             <div className="glass-card-static p-6 mb-6">
                 <div className="flex items-start justify-between">
                     {pipelineSteps.map((ps, idx) => {
@@ -206,15 +319,12 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
 
                         return (
                             <div key={ps.key} className="pipeline-step">
-                                {/* Connector line */}
                                 {!isLast && (
                                     <div className={`pipeline-connector ${prevCompleted || status === 'completed' ? 'pipeline-connector-completed' : ''}`} />
                                 )}
-                                {/* Dot */}
                                 <div className={`pipeline-dot ${dotClass}`}>
                                     {status === 'completed' ? '✓' : ps.icon}
                                 </div>
-                                {/* Label */}
                                 <p className="text-xs font-medium text-[var(--color-text-secondary)] mt-2 text-center">
                                     {ps.label}
                                 </p>
@@ -230,12 +340,9 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                 </div>
             </div>
 
-            {/* ─── Main Content: Two Panels ─── */}
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                {/* LEFT: Content Review Panel (2/3 width) */}
                 <div className="lg:col-span-2 space-y-4">
-                    {/* Processing State */}
-                    {isProcessing && !researchOutput && (
+                    {isProcessing && !researchOutput && workflow.status !== 'collaborating' && (
                         <div className="glass-card p-8 text-center">
                             <div className="w-12 h-12 border-2 border-purple-500 border-t-transparent rounded-full animate-spin-slow mx-auto mb-4" />
                             <h3 className="text-white font-semibold mb-2">
@@ -251,7 +358,15 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                         </div>
                     )}
 
-                    {/* Executive Summary */}
+                    {workflow.status === 'collaborating' && (
+                        <div className="glass-card p-6 border-purple-500/30">
+                            <h3 className="text-white font-semibold mb-2">Collaboration Active</h3>
+                            <p className="text-sm text-[var(--color-text-secondary)]">
+                                Use the workflow chat below to iterate with your collaborator.
+                            </p>
+                        </div>
+                    )}
+
                     {researchOutput?.summary && (
                         <div className="glass-card p-6">
                             <button
@@ -273,7 +388,6 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                         </div>
                     )}
 
-                    {/* Slide Outline */}
                     {researchOutput?.slide_outline && (
                         <div className="glass-card p-6">
                             <button
@@ -295,7 +409,6 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                         </div>
                     )}
 
-                    {/* Raw Research */}
                     {researchOutput?.raw_research && (
                         <div className="glass-card p-6">
                             <button
@@ -320,7 +433,6 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                         </div>
                     )}
 
-                    {/* PPT Generation Result */}
                     {generationStep?.status === 'completed' && generationStep.output_data && (
                         <div className="glass-card p-6 border-green-500/30">
                             <h3 className="text-white font-semibold flex items-center gap-2 mb-3">
@@ -340,7 +452,6 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                         </div>
                     )}
 
-                    {/* Generating PPT State */}
                     {workflow.status === 'generating_ppt' && (
                         <div className="glass-card p-8 text-center">
                             <div className="w-12 h-12 border-2 border-purple-500 border-t-transparent rounded-full animate-spin-slow mx-auto mb-4" />
@@ -351,7 +462,6 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                         </div>
                     )}
 
-                    {/* Review Actions */}
                     {isAwaitingReview && (
                         <div className="glass-card p-6 border-purple-500/30" id="review-panel">
                             <h3 className="text-white font-semibold mb-4 flex items-center gap-2">
@@ -376,7 +486,7 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                                 <textarea
                                     value={feedback}
                                     onChange={(e) => setFeedback(e.target.value)}
-                                    placeholder="e.g., Please add more data about cost analysis and include recent 2024 statistics..."
+                                    placeholder="e.g., Please add more data about cost analysis and include recent statistics..."
                                     className="w-full bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg px-4 py-3 text-white text-sm placeholder:text-[var(--color-text-muted)] focus:outline-none focus:border-purple-500 transition-colors resize-none"
                                     rows={3}
                                     disabled={submitting}
@@ -393,9 +503,107 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                             </div>
                         </div>
                     )}
+
+                    <div className="glass-card p-6" id="chat-panel">
+                        <div className="flex items-center justify-between mb-4">
+                            <h3 className="text-white font-semibold">💬 Collaboration Chat</h3>
+                            {hasAgentParticipant && (
+                                <span className="text-[10px] text-emerald-400 uppercase tracking-wider">
+                                    OpenClaw enabled
+                                </span>
+                            )}
+                        </div>
+
+                        <div className="max-h-[340px] overflow-y-auto space-y-3 pr-1">
+                            {workflow.messages.length === 0 ? (
+                                <p className="text-sm text-[var(--color-text-muted)]">No messages yet.</p>
+                            ) : (
+                                workflow.messages.map((msg) => {
+                                    const isOwn = msg.sender_id === currentUser.id;
+                                    const senderName = msg.sender?.name
+                                        || (msg.sender_type === 'agent' ? 'OpenClaw AI' : msg.sender_type === 'system' ? 'System' : 'Collaborator');
+                                    return (
+                                        <div
+                                            key={msg.id}
+                                            className={`rounded-lg p-3 border ${isOwn
+                                                ? 'bg-purple-500/10 border-purple-500/30 ml-8'
+                                                : msg.sender_type === 'agent'
+                                                    ? 'bg-emerald-500/10 border-emerald-500/30 mr-8'
+                                                    : 'bg-[var(--color-surface)] border-[var(--color-border)] mr-8'
+                                                }`}
+                                        >
+                                            <div className="flex items-center justify-between mb-1">
+                                                <span className="text-xs font-semibold text-white">{senderName}</span>
+                                                <span className="text-[10px] text-[var(--color-text-muted)]">
+                                                    {formatTime(msg.created_at)}
+                                                </span>
+                                            </div>
+                                            <p className="text-sm text-[var(--color-text-secondary)] whitespace-pre-wrap">
+                                                {msg.message}
+                                            </p>
+                                        </div>
+                                    );
+                                })
+                            )}
+                        </div>
+
+                        <div className="mt-4 flex gap-2">
+                            <textarea
+                                value={chatInput}
+                                onChange={(e) => setChatInput(e.target.value)}
+                                placeholder="Write a message for your collaborator..."
+                                rows={2}
+                                className="flex-1 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg px-4 py-2 text-white text-sm placeholder:text-[var(--color-text-muted)] focus:outline-none focus:border-purple-500 transition-colors resize-none"
+                                disabled={sendingMessage}
+                            />
+                            <button
+                                onClick={handleSendMessage}
+                                disabled={sendingMessage || !chatInput.trim()}
+                                className="btn btn-primary h-fit"
+                            >
+                                {sendingMessage ? 'Sending...' : 'Send'}
+                            </button>
+                        </div>
+
+                        {hasAgentParticipant && (
+                            <button
+                                onClick={handleGenerateFromChat}
+                                disabled={triggeringGeneration || workflow.status === 'generating_ppt'}
+                                className="btn btn-outline mt-3 w-full"
+                            >
+                                {triggeringGeneration ? 'Starting...' : '📊 Generate PPT From Chat Context'}
+                            </button>
+                        )}
+                    </div>
+
+                    {canUseCompletion && (
+                        <div className="glass-card p-6 border-emerald-500/30">
+                            <h3 className="text-white font-semibold mb-3">✅ Collaboration Completion</h3>
+                            <div className="space-y-2 mb-4">
+                                {humanApprovals.map((approval) => (
+                                    <div key={approval.id} className="flex items-center justify-between text-sm">
+                                        <span className="text-[var(--color-text-secondary)]">{approval.user?.name || `User ${approval.user_id}`}</span>
+                                        <span className={`text-xs font-semibold uppercase ${approval.status === 'ready' || approval.status === 'approved' ? 'text-emerald-400' : 'text-[var(--color-text-muted)]'}`}>
+                                            {approval.status}
+                                        </span>
+                                    </div>
+                                ))}
+                            </div>
+                            <button
+                                onClick={() => handleCompletion(isCurrentUserReady ? 'reopen' : 'mark_ready')}
+                                disabled={updatingCompletion}
+                                className="btn btn-success w-full"
+                            >
+                                {updatingCompletion
+                                    ? 'Updating...'
+                                    : isCurrentUserReady
+                                        ? '↩️ Reopen Collaboration'
+                                        : '✅ Mark Myself Ready'}
+                            </button>
+                        </div>
+                    )}
                 </div>
 
-                {/* RIGHT: Activity Feed (1/3 width) */}
                 <div className="lg:col-span-1">
                     <div className="glass-card-static p-5 sticky top-6">
                         <h3 className="text-white font-semibold mb-4 text-sm uppercase tracking-wider">

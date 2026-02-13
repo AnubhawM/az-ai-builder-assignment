@@ -54,6 +54,8 @@ class WorkflowDetailResponse(WorkflowResponse):
     owner: Optional[UserResponse] = None
     steps: List["WorkflowStepResponse"] = []
     events: List["WorkflowEventResponse"] = []
+    messages: List["WorkflowMessageResponse"] = []
+    approvals: List["WorkflowApprovalResponse"] = []
 
 
 # ──────────────────────────────────────
@@ -96,6 +98,52 @@ class WorkflowEventResponse(BaseModel):
     metadata_json: Optional[Dict[str, Any]] = None
     created_at: Optional[datetime] = None
     actor: Optional[UserResponse] = None
+
+    class Config:
+        from_attributes = True
+
+
+# ──────────────────────────────────────
+# Workflow Chat Schemas
+# ──────────────────────────────────────
+
+class WorkflowMessageCreate(BaseModel):
+    user_id: int
+    message: str
+    channel: str = "web"
+    ask_agent: Optional[bool] = None
+
+class WorkflowMessageResponse(BaseModel):
+    id: int
+    workflow_id: int
+    sender_id: Optional[int] = None
+    sender_type: str
+    channel: str
+    message: str
+    metadata_json: Optional[Dict[str, Any]] = None
+    created_at: Optional[datetime] = None
+    sender: Optional[UserResponse] = None
+
+    class Config:
+        from_attributes = True
+
+
+# ──────────────────────────────────────
+# Workflow Completion Schemas
+# ──────────────────────────────────────
+
+class WorkflowCompletionAction(BaseModel):
+    user_id: int
+    action: str  # mark_ready | reopen
+
+class WorkflowApprovalResponse(BaseModel):
+    id: int
+    workflow_id: int
+    user_id: int
+    status: str
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    user: Optional[UserResponse] = None
 
     class Config:
         from_attributes = True

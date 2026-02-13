@@ -1,5 +1,5 @@
 # database/models.py
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, JSON, ForeignKey, Text
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, JSON, ForeignKey, Text, UniqueConstraint
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from . import Base
@@ -25,6 +25,8 @@ class User(Base):
     workflows = relationship("Workflow", back_populates="owner", foreign_keys="Workflow.user_id")
     assigned_steps = relationship("WorkflowStep", back_populates="assignee", foreign_keys="WorkflowStep.assigned_to")
     events = relationship("WorkflowEvent", back_populates="actor", foreign_keys="WorkflowEvent.actor_id")
+    messages = relationship("WorkflowMessage", back_populates="sender", foreign_keys="WorkflowMessage.sender_id")
+    approvals = relationship("WorkflowApproval", back_populates="user", foreign_keys="WorkflowApproval.user_id")
 
     def __repr__(self):
         return f"<User(id={self.id}, name='{self.name}', role='{self.role}')>"
@@ -54,7 +56,7 @@ class Workflow(Base):
     workflow_type = Column(String, nullable=False)  # e.g., "ppt_generation", "citation_check", "pii_scan"
     title = Column(String, nullable=False)
     status = Column(String, nullable=False, default="pending")
-    # Status values: pending, researching, awaiting_review, refining,
+    # Status values: pending, collaborating, researching, awaiting_review, refining,
     #                generating_ppt, awaiting_presentation_review, completed, failed
     openclaw_session_id = Column(String, nullable=True)
     parent_id = Column(Integer, ForeignKey("workflows.id"), nullable=True)
@@ -68,6 +70,10 @@ class Workflow(Base):
                          cascade="all, delete-orphan")
     events = relationship("WorkflowEvent", back_populates="workflow", order_by="WorkflowEvent.created_at",
                           cascade="all, delete-orphan")
+    messages = relationship("WorkflowMessage", back_populates="workflow", order_by="WorkflowMessage.created_at",
+                            cascade="all, delete-orphan")
+    approvals = relationship("WorkflowApproval", back_populates="workflow",
+                             cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<Workflow(id={self.id}, type='{self.workflow_type}', status='{self.status}')>"
@@ -86,6 +92,8 @@ class Workflow(Base):
             "owner": self.owner.to_dict() if self.owner else None,
             "steps": [step.to_dict() for step in self.steps] if self.steps else [],
             "events": [event.to_dict() for event in self.events] if self.events else [],
+            "messages": [message.to_dict() for message in self.messages] if self.messages else [],
+            "approvals": [approval.to_dict() for approval in self.approvals] if self.approvals else [],
         }
 
 
@@ -102,6 +110,7 @@ class WorkflowStep(Base):
     step_order = Column(Integer, nullable=False, default=1)
     step_type = Column(String, nullable=False)
     # Step type values: agent_research, human_review, specialist_review,
+    #                   human_research, agent_collaboration,
     #                   agent_generation, presentation_review
     assigned_to = Column(Integer, ForeignKey("users.id"), nullable=True)  # NULL for agent steps
     provider_type = Column(String, nullable=False, default="agent")  # "agent" or "human"
@@ -154,8 +163,9 @@ class WorkflowEvent(Base):
     event_type = Column(String, nullable=False)
     # Event type values: created, research_started, research_completed,
     #                    review_requested, approved, refined, escalated,
-    #                    generation_started, generation_completed,
-    #                    notification_sent, failed
+    #                    generation_requested, generation_started, generation_completed,
+    #                    message_posted, completion_marked, reopened,
+    #                    agent_replied, notification_sent, failed
     actor_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # NULL for system/agent events
     actor_type = Column(String, nullable=False, default="system")  # "human", "agent", "system"
     channel = Column(String, nullable=True)  # "web", "slack", or NULL for system events
@@ -184,6 +194,69 @@ class WorkflowEvent(Base):
             "metadata_json": self.metadata_json,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "actor": self.actor.to_dict() if self.actor else None,
+        }
+
+
+class WorkflowMessage(Base):
+    """
+    Chat messages exchanged inside a workflow between humans, agent, and system.
+    """
+    __tablename__ = "workflow_messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    workflow_id = Column(Integer, ForeignKey("workflows.id"), nullable=False)
+    sender_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    sender_type = Column(String, nullable=False, default="human")  # human, agent, system
+    channel = Column(String, nullable=False, default="web")  # web, slack, system
+    message = Column(Text, nullable=False)
+    metadata_json = Column(JSON, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    workflow = relationship("Workflow", back_populates="messages")
+    sender = relationship("User", back_populates="messages", foreign_keys=[sender_id])
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "workflow_id": self.workflow_id,
+            "sender_id": self.sender_id,
+            "sender_type": self.sender_type,
+            "channel": self.channel,
+            "message": self.message,
+            "metadata_json": self.metadata_json,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "sender": self.sender.to_dict() if self.sender else None,
+        }
+
+
+class WorkflowApproval(Base):
+    """
+    Tracks participant completion intent for human collaboration workflows.
+    """
+    __tablename__ = "workflow_approvals"
+    __table_args__ = (
+        UniqueConstraint("workflow_id", "user_id", name="uq_workflow_approval_user"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    workflow_id = Column(Integer, ForeignKey("workflows.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    status = Column(String, nullable=False, default="pending")  # pending, ready, approved
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    workflow = relationship("Workflow", back_populates="approvals")
+    user = relationship("User", back_populates="approvals", foreign_keys=[user_id])
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "workflow_id": self.workflow_id,
+            "user_id": self.user_id,
+            "status": self.status,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "user": self.user.to_dict() if self.user else None,
         }
 
 

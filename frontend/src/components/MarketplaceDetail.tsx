@@ -88,7 +88,8 @@ const MarketplaceDetail: React.FC<MarketplaceDetailProps> = ({ requestId, curren
         setAccepting(volunteerId);
         try {
             const res = await axios.post(`${import.meta.env.VITE_API_URL}/api/marketplace/${requestId}/accept`, {
-                volunteer_id: volunteerId
+                volunteer_id: volunteerId,
+                user_id: currentUser.id
             });
             toast.success('Handshake complete! Work has begun.');
             onStartWorkflow(res.data.workflow_id);

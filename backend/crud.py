@@ -2,7 +2,11 @@
 # Database CRUD operations for the AIXplore Capability Exchange
 
 from sqlalchemy.orm import Session
-from database.models import User, Workflow, WorkflowStep, WorkflowEvent, WorkRequest, Volunteer
+from database.models import (
+    User, Workflow, WorkflowStep, WorkflowEvent,
+    WorkflowMessage, WorkflowApproval,
+    WorkRequest, Volunteer
+)
 
 
 # ──────────────────────────────────────
@@ -200,6 +204,87 @@ def get_events_for_workflow(db: Session, workflow_id: int) -> list[WorkflowEvent
         db.query(WorkflowEvent)
         .filter(WorkflowEvent.workflow_id == workflow_id)
         .order_by(WorkflowEvent.created_at.asc())
+        .all()
+    )
+
+
+# ──────────────────────────────────────
+# Workflow Chat Operations
+# ──────────────────────────────────────
+
+def create_workflow_message(
+    db: Session,
+    workflow_id: int,
+    message: str,
+    sender_id: int = None,
+    sender_type: str = "human",
+    channel: str = "web",
+    metadata_json: dict = None
+) -> WorkflowMessage:
+    new_message = WorkflowMessage(
+        workflow_id=workflow_id,
+        sender_id=sender_id,
+        sender_type=sender_type,
+        channel=channel,
+        message=message,
+        metadata_json=metadata_json,
+    )
+    db.add(new_message)
+    db.commit()
+    db.refresh(new_message)
+    return new_message
+
+
+def get_messages_for_workflow(db: Session, workflow_id: int) -> list[WorkflowMessage]:
+    return (
+        db.query(WorkflowMessage)
+        .filter(WorkflowMessage.workflow_id == workflow_id)
+        .order_by(WorkflowMessage.created_at.asc())
+        .all()
+    )
+
+
+# ──────────────────────────────────────
+# Workflow Completion Operations
+# ──────────────────────────────────────
+
+def get_workflow_approval(db: Session, workflow_id: int, user_id: int) -> WorkflowApproval | None:
+    return (
+        db.query(WorkflowApproval)
+        .filter(
+            WorkflowApproval.workflow_id == workflow_id,
+            WorkflowApproval.user_id == user_id
+        )
+        .first()
+    )
+
+
+def upsert_workflow_approval(
+    db: Session,
+    workflow_id: int,
+    user_id: int,
+    status: str
+) -> WorkflowApproval:
+    approval = get_workflow_approval(db, workflow_id, user_id)
+    if approval:
+        approval.status = status
+    else:
+        approval = WorkflowApproval(
+            workflow_id=workflow_id,
+            user_id=user_id,
+            status=status
+        )
+        db.add(approval)
+    db.commit()
+    db.refresh(approval)
+    return approval
+
+
+def get_workflow_approvals(db: Session, workflow_id: int) -> list[WorkflowApproval]:
+    return (
+        db.query(WorkflowApproval)
+        .filter(WorkflowApproval.workflow_id == workflow_id)
+        .order_by(WorkflowApproval.created_at.asc())
         .all()
     )
 

@@ -7,6 +7,10 @@ Endpoints:
     GET  /api/workflows              — List workflows (filtered by user/role)
     GET  /api/workflows/<id>         — Get full workflow detail
     POST /api/workflows/<id>/review  — Submit approve/refine action
+    GET  /api/workflows/<id>/messages — List workflow chat messages
+    POST /api/workflows/<id>/messages — Post workflow chat message
+    POST /api/workflows/<id>/completion — Mark/reopen collaborative completion
+    POST /api/workflows/<id>/generate-ppt — Trigger PPT from chat context
     POST /api/slack/interactions     — Handle inbound Slack button clicks
 """
 
@@ -30,14 +34,62 @@ from crud import (
     create_event,
     get_open_work_requests, get_work_request_by_id,
     create_work_request, create_volunteer,
-    update_volunteer_status, get_volunteer_by_id
+    update_volunteer_status, get_volunteer_by_id,
+    create_workflow_message, get_messages_for_workflow,
+    upsert_workflow_approval, get_workflow_approvals
 )
 from openclaw_client import generate_session_id
-from workflow_service import start_research, start_refinement, start_ppt_generation
+from workflow_service import (
+    start_research, start_refinement, start_ppt_generation,
+    start_agent_chat_reply
+)
 
 workflow_bp = Blueprint('workflows', __name__)
 
 SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET", "")
+
+
+def _normalize_caps(capabilities: list[str] | None) -> list[str]:
+    return [c.strip().lower() for c in (capabilities or []) if isinstance(c, str) and c.strip()]
+
+
+def _infer_workflow_type(title: str, description: str, required_capabilities: list[str] | None) -> str:
+    caps = _normalize_caps(required_capabilities)
+    haystack = f"{title} {description} {' '.join(caps)}".lower()
+
+    if any(k in haystack for k in ["compliance", "audit", "regulatory", "policy", "risk"]):
+        return "compliance_review"
+    if any(k in haystack for k in ["design", "branding", "brand", "logo", "color", "style"]):
+        return "design_alignment"
+    if any(k in haystack for k in ["research", "ppt", "powerpoint", "slides", "presentation"]):
+        return "ppt_generation"
+    return "general_collaboration"
+
+
+def _should_auto_start_agent(required_capabilities: list[str] | None) -> bool:
+    caps = set(_normalize_caps(required_capabilities))
+    auto_caps = {
+        "research", "ppt", "ppt_generation", "powerpoint", "slides", "presentation"
+    }
+    return bool(caps.intersection(auto_caps))
+
+
+def _participant_user_ids(workflow) -> set[int]:
+    participant_ids = {workflow.user_id}
+    for step in workflow.steps:
+        if step.assigned_to:
+            participant_ids.add(step.assigned_to)
+    return participant_ids
+
+
+def _has_agent_participant(workflow) -> bool:
+    for step in workflow.steps:
+        assignee = step.assignee
+        if assignee and assignee.is_agent:
+            return True
+        if step.provider_type == "agent":
+            return True
+    return False
 
 
 # ──────────────────────────────────────
@@ -159,8 +211,16 @@ def list_workflows():
         else:
             workflows = get_all_workflows(db)
 
+        workflow_payload = []
+        for workflow in workflows:
+            data = workflow.to_dict()
+            # Keep list payload lightweight for polling-heavy dashboard views.
+            data.pop("messages", None)
+            data.pop("approvals", None)
+            workflow_payload.append(data)
+
         return jsonify({
-            "workflows": [w.to_dict() for w in workflows]
+            "workflows": workflow_payload
         }), 200
     finally:
         db.close()
@@ -298,6 +358,249 @@ def submit_review(workflow_id):
         import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+    finally:
+        db.close()
+
+
+# ──────────────────────────────────────
+# Workflow Chat + Collaboration Completion
+# ──────────────────────────────────────
+
+@workflow_bp.route('/api/workflows/<int:workflow_id>/messages', methods=['GET'])
+def list_workflow_messages(workflow_id):
+    """List chat messages for a workflow."""
+    db = SessionLocal()
+    try:
+        workflow = get_workflow_by_id(db, workflow_id)
+        if not workflow:
+            return jsonify({"error": "Workflow not found"}), 404
+
+        user_id = request.args.get("user_id", type=int)
+        if user_id and user_id not in _participant_user_ids(workflow):
+            return jsonify({"error": "User is not a participant in this workflow"}), 403
+
+        messages = get_messages_for_workflow(db, workflow_id)
+        return jsonify({
+            "messages": [m.to_dict() for m in messages]
+        }), 200
+    finally:
+        db.close()
+
+
+@workflow_bp.route('/api/workflows/<int:workflow_id>/messages', methods=['POST'])
+def post_workflow_message(workflow_id):
+    """Post a chat message to a workflow and optionally trigger an OpenClaw reply."""
+    db = SessionLocal()
+    try:
+        data = request.json or {}
+        user_id = data.get("user_id")
+        raw_message = data.get("message", "")
+        channel = data.get("channel", "web")
+        ask_agent = data.get("ask_agent")
+
+        if not user_id:
+            return jsonify({"error": "user_id is required"}), 400
+        if not raw_message or not str(raw_message).strip():
+            return jsonify({"error": "message is required"}), 400
+
+        workflow = get_workflow_by_id(db, workflow_id)
+        if not workflow:
+            return jsonify({"error": "Workflow not found"}), 404
+
+        user = get_user_by_id(db, user_id)
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+
+        participant_ids = _participant_user_ids(workflow)
+        if user_id not in participant_ids:
+            return jsonify({"error": "User is not a participant in this workflow"}), 403
+
+        text = str(raw_message).strip()
+        msg = create_workflow_message(
+            db,
+            workflow_id=workflow_id,
+            sender_id=user_id,
+            sender_type="agent" if user.is_agent else "human",
+            channel=channel,
+            message=text
+        )
+        create_event(
+            db, workflow_id=workflow_id, event_type="message_posted",
+            actor_id=user_id, actor_type="agent" if user.is_agent else "human",
+            channel=channel,
+            message=f"{user.name} posted a message"
+        )
+
+        has_agent = _has_agent_participant(workflow)
+        auto_agent_reply = ask_agent if isinstance(ask_agent, bool) else has_agent
+        agent_reply_started = False
+        if auto_agent_reply and has_agent and not user.is_agent:
+            start_agent_chat_reply(workflow_id, text)
+            agent_reply_started = True
+
+        return jsonify({
+            "message": "Message posted",
+            "chat_message": msg.to_dict(),
+            "agent_reply_started": agent_reply_started
+        }), 201
+    finally:
+        db.close()
+
+
+@workflow_bp.route('/api/workflows/<int:workflow_id>/completion', methods=['POST'])
+def update_workflow_completion(workflow_id):
+    """
+    Mark collaboration readiness for human participants.
+    Workflow is auto-completed when all human participants mark ready.
+    """
+    db = SessionLocal()
+    try:
+        data = request.json or {}
+        user_id = data.get("user_id")
+        action = data.get("action")
+
+        if not user_id:
+            return jsonify({"error": "user_id is required"}), 400
+        if action not in ("mark_ready", "reopen"):
+            return jsonify({"error": "action must be mark_ready or reopen"}), 400
+
+        workflow = get_workflow_by_id(db, workflow_id)
+        if not workflow:
+            return jsonify({"error": "Workflow not found"}), 404
+
+        user = get_user_by_id(db, user_id)
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+        if user_id not in _participant_user_ids(workflow):
+            return jsonify({"error": "User is not a participant in this workflow"}), 403
+        if user.is_agent:
+            return jsonify({"error": "Agents cannot mark human workflow completion"}), 400
+        if not workflow.approvals and workflow.workflow_type not in (
+            "compliance_review", "design_alignment", "general_collaboration"
+        ):
+            return jsonify({"error": "This workflow does not use collaborative completion"}), 400
+
+        new_status = "ready" if action == "mark_ready" else "pending"
+        upsert_workflow_approval(db, workflow_id, user_id, new_status)
+
+        create_event(
+            db, workflow_id=workflow_id,
+            event_type="completion_marked" if action == "mark_ready" else "reopened",
+            actor_id=user_id, actor_type="human", channel="web",
+            message=(
+                f"{user.name} marked this collaboration as ready"
+                if action == "mark_ready"
+                else f"{user.name} reopened the collaboration"
+            )
+        )
+
+        participant_ids = _participant_user_ids(workflow)
+        human_participant_ids = []
+        for pid in participant_ids:
+            participant = get_user_by_id(db, pid)
+            if participant and not participant.is_agent:
+                human_participant_ids.append(pid)
+
+        approvals = get_workflow_approvals(db, workflow_id)
+        approval_by_user = {a.user_id: a.status for a in approvals}
+        all_humans_ready = (
+            len(human_participant_ids) >= 2
+            and all(approval_by_user.get(pid) == "ready" for pid in human_participant_ids)
+        )
+
+        if all_humans_ready:
+            update_workflow_status(db, workflow_id, "completed")
+            active_step = get_active_step(db, workflow_id)
+            if active_step:
+                update_step_status(db, active_step.id, "completed")
+            create_workflow_message(
+                db,
+                workflow_id=workflow_id,
+                sender_type="system",
+                channel="system",
+                message="All human participants marked ready. Workflow marked as completed."
+            )
+            create_event(
+                db, workflow_id=workflow_id, event_type="approved",
+                actor_type="system", channel="web",
+                message="Collaboration approved by all human participants"
+            )
+        else:
+            update_workflow_status(db, workflow_id, "collaborating")
+
+        return jsonify({
+            "message": "Completion state updated",
+            "workflow": get_workflow_by_id(db, workflow_id).to_dict()
+        }), 200
+    finally:
+        db.close()
+
+
+@workflow_bp.route('/api/workflows/<int:workflow_id>/generate-ppt', methods=['POST'])
+def generate_ppt_from_workflow_chat(workflow_id):
+    """Trigger PPT generation from collaborative chat context."""
+    db = SessionLocal()
+    try:
+        data = request.json or {}
+        user_id = data.get("user_id")
+        instructions = (data.get("instructions") or "").strip()
+
+        if not user_id:
+            return jsonify({"error": "user_id is required"}), 400
+
+        workflow = get_workflow_by_id(db, workflow_id)
+        if not workflow:
+            return jsonify({"error": "Workflow not found"}), 404
+        if workflow.status == "generating_ppt":
+            return jsonify({"error": "PPT generation is already in progress"}), 400
+
+        user = get_user_by_id(db, user_id)
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+        if user_id not in _participant_user_ids(workflow):
+            return jsonify({"error": "User is not a participant in this workflow"}), 403
+        if not _has_agent_participant(workflow):
+            return jsonify({"error": "No agent collaborator is assigned to this workflow"}), 400
+
+        recent_messages = workflow.messages[-12:] if workflow.messages else []
+        context_lines = []
+        for msg in recent_messages:
+            if msg.sender_type == "system":
+                speaker = "System"
+            elif msg.sender and msg.sender.name:
+                speaker = msg.sender.name
+            elif msg.sender_type == "agent":
+                speaker = "OpenClaw"
+            else:
+                speaker = "Human"
+            context_lines.append(f"{speaker}: {msg.message}")
+        chat_context = "\n".join(context_lines)
+
+        combined_instructions = "\n\n".join(
+            part for part in [instructions, f"Chat context:\n{chat_context}"] if part
+        )
+        if not combined_instructions.strip():
+            combined_instructions = workflow.title
+
+        create_workflow_message(
+            db,
+            workflow_id=workflow_id,
+            sender_type="system",
+            channel="system",
+            message=f"{user.name} requested PPT generation from workflow chat context."
+        )
+        create_event(
+            db, workflow_id=workflow_id, event_type="generation_requested",
+            actor_id=user_id, actor_type="human", channel="web",
+            message=f"{user.name} requested PPT generation from collaboration chat"
+        )
+
+        start_ppt_generation(workflow_id, combined_instructions, workflow.title)
+
+        return jsonify({
+            "message": "PPT generation started from workflow chat context.",
+            "workflow": get_workflow_by_id(db, workflow_id).to_dict()
+        }), 202
     finally:
         db.close()
 
@@ -485,18 +788,27 @@ def post_work_request():
         work_request = create_work_request(db, data)
 
         # ── AGENT AUTO-VOLUNTEER LOGIC ──
-        # Check if any agents match the required capabilities
-        required_caps = data.get("required_capabilities", [])
+        required_caps = _normalize_caps(data.get("required_capabilities", []))
         from database.models import User
         agents = db.query(User).filter(User.is_agent == True).all()
 
-        for agent in agents:
-            # Simple matching: if agent role matches or "research" is in caps and agent is OpenClaw
-            if "research" in required_caps and agent.email == "agent@openclaw.ai":
+        auto_agent_caps = {
+            "research", "ppt", "ppt_generation", "powerpoint",
+            "slides", "presentation", "design", "branding", "brand"
+        }
+        should_autovolunteer = bool(set(required_caps).intersection(auto_agent_caps))
+
+        if should_autovolunteer:
+            for agent in agents:
+                if agent.email != "agent@openclaw.ai":
+                    continue
                 create_volunteer(db, {
                     "request_id": work_request.id,
                     "user_id": agent.id,
-                    "note": "I'm the OpenClaw research agent. I can perform web searches and generate reports."
+                    "note": (
+                        "I can collaborate on research, content refinement, and "
+                        "SlideSpeak-based PowerPoint generation."
+                    )
                 })
 
         return jsonify({
@@ -535,6 +847,17 @@ def volunteer_for_task(request_id):
         if not user_id:
             return jsonify({"error": "user_id is required"}), 400
 
+        work_request = get_work_request_by_id(db, request_id)
+        if not work_request:
+            return jsonify({"error": "Request not found"}), 404
+        if work_request.status != "open":
+            return jsonify({"error": "This request is no longer open for volunteers"}), 400
+
+        # Avoid duplicate bids by the same user for the same request
+        for existing in work_request.volunteers:
+            if existing.user_id == user_id:
+                return jsonify({"error": "User has already volunteered for this request"}), 400
+
         volunteer = create_volunteer(db, {
             "request_id": request_id,
             "user_id": user_id,
@@ -557,8 +880,9 @@ def accept_volunteer(request_id):
     """
     db = SessionLocal()
     try:
-        data = request.json
+        data = request.json or {}
         volunteer_id = data.get("volunteer_id")
+        requester_id = data.get("user_id")
 
         if not volunteer_id:
             return jsonify({"error": "volunteer_id is required"}), 400
@@ -568,33 +892,59 @@ def accept_volunteer(request_id):
 
         if not work_request or not volunteer:
             return jsonify({"error": "Request or Volunteer not found"}), 404
+        if volunteer.request_id != request_id:
+            return jsonify({"error": "Volunteer does not belong to this request"}), 400
+        if work_request.status != "open":
+            return jsonify({"error": f"Request is already {work_request.status}"}), 400
+        if volunteer.status != "pending":
+            return jsonify({"error": f"Volunteer is already {volunteer.status}"}), 400
+        if requester_id and requester_id != work_request.requester_id:
+            return jsonify({"error": "Only the requester can accept a volunteer"}), 403
 
         # 1. Update statuses
         update_volunteer_status(db, volunteer_id, "accepted")
         work_request.status = "assigned"
+        for other in work_request.volunteers:
+            if other.id != volunteer_id and other.status == "pending":
+                update_volunteer_status(db, other.id, "rejected")
 
         # 2. Create the actual Workflow from the request
         user = volunteer.user
         session_id = f"workflow-{generate_session_id()}"
+        workflow_type = _infer_workflow_type(
+            work_request.title,
+            work_request.description,
+            work_request.required_capabilities
+        )
+        auto_start_agent = user.is_agent and _should_auto_start_agent(work_request.required_capabilities)
 
         workflow = create_workflow(
             db,
             user_id=work_request.requester_id,
             title=work_request.title,
-            workflow_type="ppt_generation", # Default
+            workflow_type=workflow_type,
             openclaw_session_id=session_id,
             parent_id=work_request.parent_workflow_id
         )
 
         # 3. Create the first step and assign it
-        step_type = "agent_research" if user.is_agent else "human_research"
+        if user.is_agent:
+            step_type = "agent_research" if auto_start_agent else "agent_collaboration"
+        elif workflow_type in ("compliance_review", "design_alignment"):
+            step_type = "specialist_review"
+        else:
+            step_type = "human_research"
         provider_type = "agent" if user.is_agent else "human"
 
-        create_workflow_step(
+        initial_step = create_workflow_step(
             db, workflow_id=workflow.id, step_order=1,
             step_type=step_type, provider_type=provider_type,
             assigned_to=user.id,
-            input_data={"topic": work_request.title, "description": work_request.description}
+            input_data={
+                "topic": work_request.title,
+                "description": work_request.description,
+                "workflow_type": workflow_type
+            }
         )
 
         # 4. Success event
@@ -604,14 +954,39 @@ def accept_volunteer(request_id):
             message=f"Handshake complete! {user.name} is starting work on: {work_request.title}"
         )
 
-        # 5. If it's an agent, trigger the service logic
-        if user.is_agent and user.email == "agent@openclaw.ai":
-            start_research(workflow.id, work_request.title, session_id)
+        # 5. Seed collaboration chat + approvals for collaborative paths
+        if not auto_start_agent:
+            update_step_status(db, initial_step.id, "in_progress")
+            update_workflow_status(db, workflow.id, "collaborating")
+            create_workflow_message(
+                db,
+                workflow_id=workflow.id,
+                sender_type="system",
+                channel="system",
+                message=(
+                    f"{work_request.requester.name} and {user.name} are now connected. "
+                    "Use this chat to collaborate, refine, and confirm completion."
+                )
+            )
+
+        if not user.is_agent:
+            upsert_workflow_approval(db, workflow.id, work_request.requester_id, "pending")
+            upsert_workflow_approval(db, workflow.id, user.id, "pending")
+
+        # 6. If it's an auto-start agent workflow, trigger service logic immediately
+        if auto_start_agent and user.email == "agent@openclaw.ai":
+            start_research(
+                workflow.id,
+                work_request.title,
+                session_id,
+                request_description=work_request.description or ""
+            )
 
         db.commit()
         return jsonify({
             "message": "Handshake complete! Work has begun.",
-            "workflow_id": workflow.id
+            "workflow_id": workflow.id,
+            "workflow_type": workflow.workflow_type
         }), 200
 
     except Exception as e:
@@ -634,6 +1009,9 @@ def accept_volunteer(request_id):
 @workflow_bp.route('/api/workflows', methods=['OPTIONS'])
 @workflow_bp.route('/api/workflows/<int:workflow_id>', methods=['OPTIONS'])
 @workflow_bp.route('/api/workflows/<int:workflow_id>/review', methods=['OPTIONS'])
+@workflow_bp.route('/api/workflows/<int:workflow_id>/messages', methods=['OPTIONS'])
+@workflow_bp.route('/api/workflows/<int:workflow_id>/completion', methods=['OPTIONS'])
+@workflow_bp.route('/api/workflows/<int:workflow_id>/generate-ppt', methods=['OPTIONS'])
 @workflow_bp.route('/api/slack/interactions', methods=['OPTIONS'])
 def handle_workflow_options(**kwargs):
     """Handle preflight CORS requests for workflow endpoints."""
