@@ -1536,6 +1536,13 @@ def accept_volunteer(request_id):
         )
 
         # 5. Seed collaboration chat + approvals for collaborative paths
+        should_send_agent_kickoff = False
+        kickoff_prompt = (
+            "Please acknowledge the requester description for this workflow, "
+            "summarize the requirements you will follow, and ask whether they "
+            "want to refine anything before pressing 'Start Agent Research'."
+        )
+
         if not auto_start_agent:
             update_step_status(db, initial_step.id, "in_progress")
             update_workflow_status(db, workflow.id, "collaborating")
@@ -1560,12 +1567,15 @@ def accept_volunteer(request_id):
                         "then requester uses 'Start Agent Research' when ready."
                     )
                 )
+                should_send_agent_kickoff = True
 
         if not user.is_agent:
             upsert_workflow_approval(db, workflow.id, work_request.requester_id, "pending")
             upsert_workflow_approval(db, workflow.id, user.id, "pending")
 
         db.commit()
+        if should_send_agent_kickoff:
+            start_agent_chat_reply(workflow.id, kickoff_prompt)
         return jsonify({
             "message": "Handshake complete! Work has begun.",
             "workflow_id": workflow.id,

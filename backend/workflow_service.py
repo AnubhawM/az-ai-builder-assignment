@@ -832,7 +832,17 @@ def _normalize_reconciled_generation_spec(raw_spec: Any, default_slide_count: in
             pass
 
     tone = str(spec.get("tone") or "professional").strip().lower()
-    if tone not in {"professional", "formal", "executive", "academic", "technical", "conversational"}:
+    # SlideSpeak expects: default | casual | professional | funny | educational | sales_pitch.
+    # Keep backward compatibility with prior reconciliation vocabulary.
+    tone_aliases = {
+        "formal": "professional",
+        "executive": "professional",
+        "academic": "educational",
+        "technical": "educational",
+        "conversational": "casual",
+    }
+    tone = tone_aliases.get(tone, tone)
+    if tone not in {"default", "casual", "professional", "funny", "educational", "sales_pitch"}:
         tone = "professional"
 
     verbosity = str(spec.get("verbosity") or "text-heavy").strip().lower()
@@ -891,7 +901,7 @@ RESPONSE FORMAT:
 Return ONLY valid JSON with this exact schema:
 {{
   "slide_count": number,
-  "tone": "professional|formal|executive|academic|technical|conversational",
+  "tone": "default|casual|professional|funny|educational|sales_pitch",
   "verbosity": "concise|standard|text-heavy",
   "design_instructions": "string",
   "content_instructions": "string",
