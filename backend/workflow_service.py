@@ -40,6 +40,7 @@ SLIDESPEAK_GENERATE_TIMEOUT_SECONDS = 240
 SLIDESPEAK_STATUS_POLL_INTERVAL_SECONDS = 5
 SLIDESPEAK_COMMAND_BUFFER_SECONDS = 20
 SLIDESPEAK_DOWNLOAD_TIMEOUT_SECONDS = 60
+PROMPT_RECONCILIATION_TIMEOUT_SECONDS = 120
 
 
 # ──────────────────────────────────────
@@ -805,9 +806,146 @@ def _download_to_file(download_url: str, file_path: str) -> int:
     return os.path.getsize(file_path)
 
 
+def _coerce_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "yes", "1"}:
+            return True
+        if lowered in {"false", "no", "0"}:
+            return False
+    return None
+
+
+def _normalize_reconciled_generation_spec(raw_spec: Any, default_slide_count: int) -> dict:
+    spec: dict[str, Any] = raw_spec if isinstance(raw_spec, dict) else {}
+
+    slide_count = default_slide_count
+    raw_slide_count = spec.get("slide_count")
+    if isinstance(raw_slide_count, int):
+        slide_count = max(4, min(20, raw_slide_count))
+    elif isinstance(raw_slide_count, str):
+        try:
+            slide_count = max(4, min(20, int(raw_slide_count.strip())))
+        except ValueError:
+            pass
+
+    tone = str(spec.get("tone") or "professional").strip().lower()
+    if tone not in {"professional", "formal", "executive", "academic", "technical", "conversational"}:
+        tone = "professional"
+
+    verbosity = str(spec.get("verbosity") or "text-heavy").strip().lower()
+    # SlideSpeak expects: concise | standard | text-heavy.
+    # Keep backward compatibility with older "balanced" values.
+    if verbosity == "balanced":
+        verbosity = "standard"
+    if verbosity not in {"concise", "standard", "text-heavy"}:
+        verbosity = "text-heavy"
+
+    design_instructions = str(spec.get("design_instructions") or "").strip()[:1200]
+    content_instructions = str(spec.get("content_instructions") or "").strip()[:1200]
+
+    must_include = spec.get("must_include")
+    must_avoid = spec.get("must_avoid")
+    must_include_items = [
+        str(item).strip()[:220]
+        for item in (must_include if isinstance(must_include, list) else [])
+        if str(item).strip()
+    ][:12]
+    must_avoid_items = [
+        str(item).strip()[:220]
+        for item in (must_avoid if isinstance(must_avoid, list) else [])
+        if str(item).strip()
+    ][:12]
+
+    include_cover = _coerce_bool(spec.get("include_cover"))
+    include_toc = _coerce_bool(spec.get("include_toc"))
+
+    return {
+        "slide_count": slide_count,
+        "tone": tone,
+        "verbosity": verbosity,
+        "design_instructions": design_instructions,
+        "content_instructions": content_instructions,
+        "must_include": must_include_items,
+        "must_avoid": must_avoid_items,
+        "include_cover": include_cover,
+        "include_toc": include_toc,
+    }
+
+
+def _build_prompt_reconciliation_prompt(presentation_focus: str, research_text: str, default_slide_count: int) -> str:
+    focus_text = (presentation_focus or "").strip() or "the requester brief"
+    focus_excerpt = focus_text[:1600] + ("..." if len(focus_text) > 1600 else "")
+    context_excerpt = (research_text or "").strip()[:9000]
+
+    return f"""You are preparing instructions for a presentation generator.
+
+TASK:
+Reconcile all requester instructions from the context into one generation spec.
+Prioritize explicit requester requests in refinement notes and chat context.
+If conflicts exist, choose the most recent explicit requester instruction.
+
+RESPONSE FORMAT:
+Return ONLY valid JSON with this exact schema:
+{{
+  "slide_count": number,
+  "tone": "professional|formal|executive|academic|technical|conversational",
+  "verbosity": "concise|standard|text-heavy",
+  "design_instructions": "string",
+  "content_instructions": "string",
+  "must_include": ["string"],
+  "must_avoid": ["string"],
+  "include_cover": true|false|null,
+  "include_toc": true|false|null
+}}
+
+RULES:
+- Set slide_count from explicit requester intent when present; otherwise use {default_slide_count}.
+- Keep design_instructions specific: style, visual direction, typography, color intent, chart/image preferences.
+- Keep content_instructions specific: audience level, depth, structure preferences.
+- If unknown, use sensible defaults and empty lists.
+- Do not include markdown or explanations.
+
+REQUESTER BRIEF:
+{focus_excerpt}
+
+CONTEXT:
+{context_excerpt}
+"""
+
+
+def _reconcile_generation_spec_with_agent(
+    presentation_focus: str,
+    research_text: str,
+    openclaw_session_id: str | None
+) -> dict:
+    default_slide_count = _infer_slide_count_from_context(research_text, default=8)
+    fallback_spec = _normalize_reconciled_generation_spec({}, default_slide_count)
+    prompt = _build_prompt_reconciliation_prompt(presentation_focus, research_text, default_slide_count)
+
+    result = ask_openclaw(
+        message=prompt,
+        session_id=openclaw_session_id,
+        timeout=PROMPT_RECONCILIATION_TIMEOUT_SECONDS
+    )
+    if not result.get("success"):
+        return {**fallback_spec, "source": "fallback", "error": result.get("error", "reconciliation_failed")}
+
+    payload = _extract_json_payload(result.get("output", ""))
+    if not payload:
+        return {**fallback_spec, "source": "fallback", "error": "reconciliation_unreadable_json"}
+
+    normalized = _normalize_reconciled_generation_spec(payload, default_slide_count)
+    normalized["source"] = "agent_reconciled"
+    return normalized
+
+
 def _generate_ppt_via_slidespeak(
     presentation_focus: str,
     research_text: str,
+    generation_spec: dict | None = None,
     filename_hint: str | None = None
 ) -> dict:
     if not os.path.isdir(SLIDESPEAK_SKILL_DIR):
@@ -820,8 +958,28 @@ def _generate_ppt_via_slidespeak(
 
     focus_text = (presentation_focus or "").strip() or "the requester brief"
     focus_excerpt = focus_text[:2000] + ("..." if len(focus_text) > 2000 else "")
-    slide_count = _infer_slide_count_from_context(research_text, default=8)
+    normalized_spec = _normalize_reconciled_generation_spec(
+        generation_spec,
+        _infer_slide_count_from_context(research_text, default=8)
+    )
+    slide_count = normalized_spec["slide_count"]
     research_excerpt = research_text[:8000]
+
+    extra_sections: list[str] = []
+    if normalized_spec["design_instructions"]:
+        extra_sections.append(f"Design/style instructions:\n{normalized_spec['design_instructions']}")
+    if normalized_spec["content_instructions"]:
+        extra_sections.append(f"Content shaping instructions:\n{normalized_spec['content_instructions']}")
+    if normalized_spec["must_include"]:
+        extra_sections.append(
+            "Must include:\n" + "\n".join(f"- {item}" for item in normalized_spec["must_include"])
+        )
+    if normalized_spec["must_avoid"]:
+        extra_sections.append(
+            "Must avoid:\n" + "\n".join(f"- {item}" for item in normalized_spec["must_avoid"])
+        )
+    spec_block = "\n\n".join(extra_sections)
+
     generation_prompt = (
         "Create a high-content professional presentation.\n\n"
         "HARD REQUIREMENTS:\n"
@@ -834,17 +992,24 @@ def _generate_ppt_via_slidespeak(
         f"Requester brief (highest priority):\n{focus_excerpt}\n\n"
         f"Research, outline, and refinement context:\n{research_excerpt}"
     )
+    if spec_block:
+        generation_prompt += f"\n\nRECONCILED REQUESTER INSTRUCTIONS (APPLY THESE):\n{spec_block}"
+
+    generate_args = [
+        "generate",
+        "--text", generation_prompt,
+        "--length", str(slide_count),
+        "--tone", normalized_spec["tone"],
+        "--verbosity", normalized_spec["verbosity"],
+        "--timeout", str(SLIDESPEAK_GENERATE_TIMEOUT_SECONDS),
+    ]
+    if normalized_spec["include_cover"] is not True:
+        generate_args.append("--no-cover")
+    if normalized_spec["include_toc"] is not True:
+        generate_args.append("--no-toc")
+
     generate_data = _run_slidespeak_command(
-        [
-            "generate",
-            "--text", generation_prompt,
-            "--length", str(slide_count),
-            "--tone", "professional",
-            "--verbosity", "text-heavy",
-            "--no-cover",
-            "--no-toc",
-            "--timeout", str(SLIDESPEAK_GENERATE_TIMEOUT_SECONDS),
-        ],
+        generate_args,
         timeout_seconds=SLIDESPEAK_GENERATE_TIMEOUT_SECONDS + SLIDESPEAK_COMMAND_BUFFER_SECONDS
     )
 
@@ -878,6 +1043,7 @@ def _generate_ppt_via_slidespeak(
         "file_size_formatted": f"{file_size / 1024:.1f} KB",
         "request_id": request_id,
         "task_id": task_id or None,
+        "generation_spec": normalized_spec,
     }
 
 
@@ -936,9 +1102,38 @@ def _run_ppt_generation_thread(
             message="SlideSpeak PPT generation started"
         )
 
+        session_id = workflow.openclaw_session_id
+        if not session_id:
+            session_id = f"workflow-{generate_session_id()}"
+            update_workflow_status(db, workflow_id, "generating_ppt", openclaw_session_id=session_id)
+
+        generation_spec = _reconcile_generation_spec_with_agent(
+            presentation_focus=presentation_focus,
+            research_text=research_text,
+            openclaw_session_id=session_id
+        )
+        spec_summary = (
+            f"Prompt reconciliation applied: {generation_spec.get('slide_count', 8)} slides, "
+            f"tone={generation_spec.get('tone', 'professional')}, "
+            f"verbosity={generation_spec.get('verbosity', 'text-heavy')}, "
+            f"source={generation_spec.get('source', 'fallback')}"
+        )
+        create_event(
+            db, workflow_id=workflow_id, event_type="generation_reconciled",
+            actor_type="agent", step_id=gen_step.id,
+            message=spec_summary
+        )
+        update_step_status(
+            db,
+            gen_step.id,
+            "in_progress",
+            output_data={"generation_spec": generation_spec}
+        )
+
         ppt_result = _generate_ppt_via_slidespeak(
             presentation_focus=presentation_focus,
             research_text=research_text,
+            generation_spec=generation_spec,
             filename_hint=filename_hint
         )
 
