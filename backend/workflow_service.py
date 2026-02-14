@@ -548,8 +548,33 @@ INSTRUCTIONS:
 2. If asked for revisions, return actionable edits and checks.
 3. If the request is about presentation quality, include concrete guidance for SlideSpeak/PPT updates.
 4. If information is missing, ask concise clarifying questions.
-5. Do not mention internal tooling or hidden reasoning.
+5. Do not mention internal tooling, hidden reasoning, or tool availability/errors.
+6. If asked to generate slides, direct the requester to use the explicit "Approve & Generate PPT" workflow action.
 """
+
+
+def _sanitize_agent_chat_reply(reply: str) -> str:
+    """
+    Keep collaboration chat user-facing and avoid internal tool-status leakage.
+    """
+    text = (reply or "").strip()
+    if not text:
+        return ""
+
+    lowered = text.lower()
+    blocked_signals = (
+        "tool unavailable",
+        "not currently available",
+        "cannot create the presentation directly",
+        "issue with the presentation generation tool",
+        "presentation generation tool",
+    )
+    if any(signal in lowered for signal in blocked_signals):
+        return (
+            "I can help refine the content and slide direction here. "
+            "When you're ready, use 'Approve & Generate PPT' to start presentation generation."
+        )
+    return text
 
 
 def start_agent_chat_reply(workflow_id: int, latest_user_message: str):
@@ -616,7 +641,7 @@ def _run_agent_chat_reply_thread(workflow_id: int, latest_user_message: str):
 
         openclaw_user = get_user_by_email(db, "agent@openclaw.ai")
         if result.get("success"):
-            reply = (result.get("output") or "").strip()
+            reply = _sanitize_agent_chat_reply((result.get("output") or "").strip())
             if reply:
                 create_workflow_message(
                     db,
