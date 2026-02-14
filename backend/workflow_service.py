@@ -12,20 +12,34 @@ import threading
 import time
 import os
 import re
+import json
+import subprocess
+from typing import Any
+
+import requests
 from database import SessionLocal
 from database.models import Workflow, WorkflowStep
 from crud import (
     get_workflow_by_id, update_workflow_status,
-    create_workflow_step, get_active_step,
+    create_workflow_step, get_active_step_by_type, get_step_by_id,
     update_step_status, increment_step_iteration,
     create_event, create_workflow_message,
     get_user_by_email, get_work_request_by_id
 )
 from openclaw_client import ask_openclaw, generate_session_id
-from openclaw_webhook_client import trigger_agent
 
-# PPT output directory (shared with existing PPT generation logic)
-PPT_OUTPUT_DIR = "/Users/anubhawmathur/development/ppt-output"
+# PPT output + SlideSpeak paths (override in backend/.env for portability)
+PPT_OUTPUT_DIR = os.getenv("PPT_OUTPUT_DIR", "/Users/anubhawmathur/development/ppt-output")
+SLIDESPEAK_SKILL_DIR = os.getenv(
+    "SLIDESPEAK_SKILL_DIR",
+    "/Users/anubhawmathur/.openclaw/workspace/skills/slidespeak"
+)
+SLIDESPEAK_SCRIPT_PATH = os.getenv("SLIDESPEAK_SCRIPT_PATH", "scripts/slidespeak.mjs")
+SLIDESPEAK_MAX_WAIT_SECONDS = 300
+SLIDESPEAK_GENERATE_TIMEOUT_SECONDS = 240
+SLIDESPEAK_STATUS_POLL_INTERVAL_SECONDS = 5
+SLIDESPEAK_COMMAND_BUFFER_SECONDS = 20
+SLIDESPEAK_DOWNLOAD_TIMEOUT_SECONDS = 60
 
 
 # ──────────────────────────────────────
@@ -156,19 +170,29 @@ Write a 2-3 paragraph executive summary of your findings. Include the most impor
 === SLIDE OUTLINE ===
 Create a {num_slides}-slide presentation outline. For each slide, provide:
 Slide 1: [Title]
-- [Key point 1]
-- [Key point 2]
-- [Key point 3]
+- [Content-rich bullet 1: full sentence with concrete detail]
+- [Content-rich bullet 2: full sentence with concrete detail]
+- [Content-rich bullet 3: full sentence with concrete detail]
+- [Content-rich bullet 4: full sentence with concrete detail]
+- [Content-rich bullet 5: full sentence with concrete detail]
 
 Slide 2: [Title]
-- [Key point 1]
-- [Key point 2]
-- [Key point 3]
+- [Content-rich bullet 1: full sentence with concrete detail]
+- [Content-rich bullet 2: full sentence with concrete detail]
+- [Content-rich bullet 3: full sentence with concrete detail]
+- [Content-rich bullet 4: full sentence with concrete detail]
+- [Content-rich bullet 5: full sentence with concrete detail]
 
 (Continue for all {num_slides} slides)
 
 === RAW RESEARCH ===
 Include your complete research findings with all data points, statistics, sources, and detailed information gathered from your web search.
+
+QUALITY REQUIREMENTS:
+- Each slide must have at least 5 substantial bullets.
+- Bullets should be 12-28 words each, not fragments.
+- Include specific names, dates, figures, and examples where available.
+- Avoid generic filler statements.
 
 IMPORTANT: Execute the web_search NOW, then organize and return your findings in the format above."""
 
@@ -196,42 +220,70 @@ INSTRUCTIONS:
 === RAW RESEARCH ===
 [Updated research with any new findings added to the previous research]
 
+QUALITY REQUIREMENTS:
+- Keep the same number of slides unless feedback asks otherwise.
+- For every slide include at least 5 substantial bullets (12-28 words each).
+- Add concrete details, evidence, and specific examples wherever possible.
+- Do not return terse placeholder bullets.
+
 Make sure to incorporate the reviewer's feedback while preserving the valuable parts of your original research."""
 
 
-def start_research(workflow_id: int, topic: str, openclaw_session_id: str, request_description: str = ""):
+def start_research(
+    workflow_id: int,
+    topic: str,
+    openclaw_session_id: str,
+    request_description: str = "",
+    research_step_id: int | None = None
+):
     """
     Launch a background thread to run OpenClaw research.
     Updates the database with results when complete.
     """
     thread = threading.Thread(
         target=_run_research_thread,
-        args=(workflow_id, topic, openclaw_session_id, request_description),
+        args=(workflow_id, topic, openclaw_session_id, request_description, research_step_id),
         daemon=True
     )
     thread.start()
     return thread
 
 
-def _run_research_thread(workflow_id: int, topic: str, openclaw_session_id: str, request_description: str = ""):
+def _run_research_thread(
+    workflow_id: int,
+    topic: str,
+    openclaw_session_id: str,
+    request_description: str = "",
+    research_step_id: int | None = None
+):
     """Background thread: executes OpenClaw research and updates DB."""
     db = SessionLocal()
     try:
         # Update workflow status to researching
         update_workflow_status(db, workflow_id, "researching")
 
-        # Get the active research step
-        step = get_active_step(db, workflow_id)
+        # Get the target research step for this run.
+        if research_step_id:
+            step = get_step_by_id(db, research_step_id)
+            if (not step or step.workflow_id != workflow_id or step.step_type != "agent_research"
+                    or step.status not in ("pending", "in_progress", "awaiting_input")):
+                print(f"[Workflow {workflow_id}] ERROR: Provided research step {research_step_id} is not active/valid")
+                return
+        else:
+            step = get_active_step_by_type(db, workflow_id, "agent_research")
         if not step:
             print(f"[Workflow {workflow_id}] ERROR: No active step found")
             return
         update_step_status(db, step.id, "in_progress")
 
         # Log the research start event
+        topic_preview = re.sub(r"\s+", " ", (topic or "").strip())
+        if len(topic_preview) > 120:
+            topic_preview = topic_preview[:117] + "..."
         create_event(
             db, workflow_id=workflow_id, event_type="research_started",
             actor_type="agent", step_id=step.id,
-            message=f"OpenClaw agent started researching: {topic}"
+            message=f"OpenClaw agent started researching: {topic_preview}"
         )
 
         # Build prompt and call OpenClaw (synchronous — blocks this thread)
@@ -244,6 +296,15 @@ def _run_research_thread(workflow_id: int, topic: str, openclaw_session_id: str,
             timeout=300  # 5 minutes
         )
 
+        # Guardrail: if the workflow was cancelled/failed while the agent was running,
+        # do not overwrite the newer terminal state with stale results.
+        current_workflow = get_workflow_by_id(db, workflow_id)
+        current_step = get_step_by_id(db, step.id)
+        if (not current_workflow or current_workflow.status != "researching"
+                or not current_step or current_step.status == "failed"):
+            print(f"[Workflow {workflow_id}] Research result ignored because workflow state changed.")
+            return
+
         if result.get("success"):
             output = result.get("output", "")
             parsed = parse_research_output(output)
@@ -255,8 +316,9 @@ def _run_research_thread(workflow_id: int, topic: str, openclaw_session_id: str,
             workflow = get_workflow_by_id(db, workflow_id)
 
             # Create the human review step (assigned to the workflow owner)
+            next_step_order = max((s.step_order for s in workflow.steps), default=0) + 1
             review_step = create_workflow_step(
-                db, workflow_id=workflow_id, step_order=2,
+                db, workflow_id=workflow_id, step_order=next_step_order,
                 step_type="human_review", provider_type="human",
                 assigned_to=workflow.user_id,
                 input_data={"instructions": "Review the research and approve or request refinements."}
@@ -343,13 +405,22 @@ def _run_refinement_thread(workflow_id: int, feedback: str, openclaw_session_id:
         # Update workflow status
         update_workflow_status(db, workflow_id, "refining")
 
-        # Find the research step (step_order=1) to update its output
+        # Find the latest completed research step to update its output.
         workflow = get_workflow_by_id(db, workflow_id)
         research_step = None
-        for step in workflow.steps:
-            if step.step_type == "agent_research":
+        ordered_steps = sorted(
+            workflow.steps,
+            key=lambda step: ((step.step_order or 0), (step.id or 0))
+        )
+        for step in reversed(ordered_steps):
+            if step.step_type == "agent_research" and step.output_data:
                 research_step = step
                 break
+        if not research_step:
+            for step in reversed(ordered_steps):
+                if step.step_type == "agent_research":
+                    research_step = step
+                    break
 
         if not research_step:
             print(f"[Workflow {workflow_id}] ERROR: No research step found for refinement")
@@ -377,6 +448,14 @@ def _run_refinement_thread(workflow_id: int, feedback: str, openclaw_session_id:
             timeout=300
         )
 
+        # Guardrail: avoid applying stale refinement output after cancellation/failover.
+        current_workflow = get_workflow_by_id(db, workflow_id)
+        current_research_step = get_step_by_id(db, research_step.id)
+        if (not current_workflow or current_workflow.status != "refining"
+                or not current_research_step or current_research_step.status == "failed"):
+            print(f"[Workflow {workflow_id}] Refinement result ignored because workflow state changed.")
+            return
+
         if result.get("success"):
             output = result.get("output", "")
             parsed = parse_research_output(output)
@@ -384,9 +463,9 @@ def _run_refinement_thread(workflow_id: int, feedback: str, openclaw_session_id:
             # Update research step with refined output
             update_step_status(db, research_step.id, "completed", output_data=parsed)
 
-            # Update the review step back to awaiting_input
+            # Update the latest review step back to awaiting_input.
             review_step = None
-            for step in workflow.steps:
+            for step in reversed(ordered_steps):
                 if step.step_type == "human_review":
                     review_step = step
                     break
@@ -447,12 +526,16 @@ def _build_agent_chat_prompt(
     workflow_title: str,
     workflow_type: str,
     latest_user_message: str,
-    recent_chat_context: str
+    recent_chat_context: str,
+    request_description: str = ""
 ) -> str:
+    description_block = request_description.strip() or "No explicit requester description provided."
     return f"""You are OpenClaw, collaborating inside the AIXplore Capability Exchange.
 
 WORKFLOW TITLE: {workflow_title}
 WORKFLOW TYPE: {workflow_type}
+REQUEST DESCRIPTION:
+{description_block}
 
 RECENT CHAT CONTEXT:
 {recent_chat_context}
@@ -508,11 +591,21 @@ def _run_agent_chat_reply_thread(workflow_id: int, latest_user_message: str):
             context_lines.append(f"{speaker}: {msg.message}")
 
         recent_chat_context = "\n".join(context_lines) if context_lines else "No prior chat context."
+        request_description = ""
+        for step in workflow.steps:
+            payload = step.input_data or {}
+            if isinstance(payload, dict):
+                desc = (payload.get("description") or "").strip()
+                if desc:
+                    request_description = desc
+                    break
+
         prompt = _build_agent_chat_prompt(
             workflow_title=workflow.title,
             workflow_type=workflow.workflow_type,
             latest_user_message=latest_user_message,
-            recent_chat_context=recent_chat_context
+            recent_chat_context=recent_chat_context,
+            request_description=request_description
         )
 
         result = ask_openclaw(
@@ -567,25 +660,233 @@ def _run_agent_chat_reply_thread(workflow_id: int, latest_user_message: str):
 # PPT Generation Pipeline
 # ──────────────────────────────────────
 
-def start_ppt_generation(workflow_id: int, research_text: str, topic: str):
+def _sanitize_topic_for_filename(topic: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", (topic or "").strip().lower()).strip("_")
+    return (slug[:80] if slug else "presentation")
+
+
+def _infer_slide_count_from_context(context_text: str, default: int = 8) -> int:
+    matches = re.findall(r"(?im)^\s*slide\s+(\d{1,2})\s*[:\-]", context_text or "")
+    if not matches:
+        return default
+    try:
+        inferred = max(int(m) for m in matches)
+    except ValueError:
+        return default
+    return max(4, min(15, inferred))
+
+
+def _extract_json_payload(raw_output: str) -> dict | None:
+    text = (raw_output or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+
+    first = text.find("{")
+    last = text.rfind("}")
+    if first == -1 or last == -1 or last <= first:
+        return None
+    try:
+        parsed = json.loads(text[first:last + 1])
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
+def _deep_find_first(payload: Any, expected_keys: set[str]) -> str | None:
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            normalized_key = re.sub(r"[^a-z0-9]+", "", str(key).lower())
+            if normalized_key in expected_keys and isinstance(value, str) and value.strip():
+                return value.strip()
+        for value in payload.values():
+            found = _deep_find_first(value, expected_keys)
+            if found:
+                return found
+    elif isinstance(payload, list):
+        for item in payload:
+            found = _deep_find_first(item, expected_keys)
+            if found:
+                return found
+    return None
+
+
+def _run_slidespeak_command(args: list[str], timeout_seconds: int) -> dict:
+    script_path = SLIDESPEAK_SCRIPT_PATH
+    script_file = (
+        script_path if os.path.isabs(script_path)
+        else os.path.join(SLIDESPEAK_SKILL_DIR, script_path)
+    )
+    if not os.path.isfile(script_file):
+        raise RuntimeError(
+            f"SlideSpeak script not found at: {script_file}. "
+            "Set SLIDESPEAK_SKILL_DIR/SLIDESPEAK_SCRIPT_PATH in backend/.env."
+        )
+
+    cmd = ["node", SLIDESPEAK_SCRIPT_PATH, *args]
+    result = subprocess.run(
+        cmd,
+        cwd=SLIDESPEAK_SKILL_DIR,
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds
+    )
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+
+    if result.returncode != 0:
+        message = stderr or stdout or f"SlideSpeak command failed with exit code {result.returncode}"
+        raise RuntimeError(message)
+
+    payload = _extract_json_payload(stdout)
+    if not payload:
+        raise RuntimeError("SlideSpeak returned an unreadable response payload")
+
+    if not payload.get("success"):
+        raise RuntimeError(str(payload.get("error", "SlideSpeak returned success=false")))
+
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise RuntimeError("SlideSpeak returned an unexpected data payload")
+    return data
+
+
+def _poll_slidespeak_status(task_id: str, deadline_epoch: float) -> dict:
+    while time.time() < deadline_epoch:
+        status_data = _run_slidespeak_command(
+            ["status", task_id],
+            timeout_seconds=SLIDESPEAK_STATUS_POLL_INTERVAL_SECONDS + SLIDESPEAK_COMMAND_BUFFER_SECONDS
+        )
+        task_status = str(status_data.get("task_status", "")).upper()
+        if task_status == "SUCCESS":
+            return status_data
+        if task_status in {"FAILURE", "ERROR"}:
+            raise RuntimeError(f"SlideSpeak task failed with status {task_status}")
+        time.sleep(SLIDESPEAK_STATUS_POLL_INTERVAL_SECONDS)
+    raise TimeoutError("SlideSpeak status polling timed out")
+
+
+def _download_to_file(download_url: str, file_path: str) -> int:
+    response = requests.get(download_url, stream=True, timeout=SLIDESPEAK_DOWNLOAD_TIMEOUT_SECONDS)
+    response.raise_for_status()
+    with open(file_path, "wb") as handle:
+        for chunk in response.iter_content(chunk_size=8192):
+            if chunk:
+                handle.write(chunk)
+    return os.path.getsize(file_path)
+
+
+def _generate_ppt_via_slidespeak(
+    presentation_focus: str,
+    research_text: str,
+    filename_hint: str | None = None
+) -> dict:
+    if not os.path.isdir(SLIDESPEAK_SKILL_DIR):
+        raise RuntimeError(f"SlideSpeak skill directory not found: {SLIDESPEAK_SKILL_DIR}")
+    if not os.environ.get("SLIDESPEAK_API_KEY"):
+        raise RuntimeError("SLIDESPEAK_API_KEY is not set in backend environment")
+
+    os.makedirs(PPT_OUTPUT_DIR, exist_ok=True)
+    deadline_epoch = time.time() + SLIDESPEAK_MAX_WAIT_SECONDS
+
+    focus_text = (presentation_focus or "").strip() or "the requester brief"
+    focus_excerpt = focus_text[:2000] + ("..." if len(focus_text) > 2000 else "")
+    slide_count = _infer_slide_count_from_context(research_text, default=8)
+    research_excerpt = research_text[:8000]
+    generation_prompt = (
+        "Create a high-content professional presentation.\n\n"
+        "HARD REQUIREMENTS:\n"
+        f"- Create exactly {slide_count} slides.\n"
+        "- Follow the provided slide outline as the primary structure.\n"
+        "- Each slide must contain a clear title plus 4-6 content-rich bullets.\n"
+        "- Bullets should be specific and informative, with concrete facts, names, dates, or examples when available.\n"
+        "- Incorporate all refinement requests and collaboration constraints from the context.\n"
+        "- Avoid vague, generic, or one-line placeholder bullets.\n\n"
+        f"Requester brief (highest priority):\n{focus_excerpt}\n\n"
+        f"Research, outline, and refinement context:\n{research_excerpt}"
+    )
+    generate_data = _run_slidespeak_command(
+        [
+            "generate",
+            "--text", generation_prompt,
+            "--length", str(slide_count),
+            "--tone", "professional",
+            "--verbosity", "text-heavy",
+            "--no-cover",
+            "--no-toc",
+            "--timeout", str(SLIDESPEAK_GENERATE_TIMEOUT_SECONDS),
+        ],
+        timeout_seconds=SLIDESPEAK_GENERATE_TIMEOUT_SECONDS + SLIDESPEAK_COMMAND_BUFFER_SECONDS
+    )
+
+    task_id = str(generate_data.get("task_id", "")).strip()
+    if generate_data.get("complete") is False and task_id:
+        generate_data = _poll_slidespeak_status(task_id, deadline_epoch)
+
+    request_id = _deep_find_first(generate_data, {"requestid"})
+    if not request_id:
+        raise RuntimeError("SlideSpeak generation finished but no request_id was returned")
+
+    download_data = _run_slidespeak_command(
+        ["download", request_id],
+        timeout_seconds=SLIDESPEAK_DOWNLOAD_TIMEOUT_SECONDS + SLIDESPEAK_COMMAND_BUFFER_SECONDS
+    )
+    download_url = _deep_find_first(download_data, {"downloadurl", "url"})
+    if not download_url:
+        raise RuntimeError("SlideSpeak download response did not include a download URL")
+
+    base_name = _sanitize_topic_for_filename(filename_hint or focus_text)
+    filename = f"{base_name}_{int(time.time())}.pptx"
+    file_path = os.path.join(PPT_OUTPUT_DIR, filename)
+    file_size = _download_to_file(download_url, file_path)
+    if file_size <= 0:
+        raise RuntimeError("Downloaded PPT file is empty")
+
+    return {
+        "file_name": filename,
+        "file_path": file_path,
+        "file_size": file_size,
+        "file_size_formatted": f"{file_size / 1024:.1f} KB",
+        "request_id": request_id,
+        "task_id": task_id or None,
+    }
+
+
+def start_ppt_generation(
+    workflow_id: int,
+    research_text: str,
+    presentation_focus: str,
+    filename_hint: str | None = None
+):
     """
-    Launch a background thread to generate a PPT via SlideSpeak
-    and poll for the output file.
+    Launch a background thread to generate a PPT via SlideSpeak.
     """
     thread = threading.Thread(
         target=_run_ppt_generation_thread,
-        args=(workflow_id, research_text, topic),
+        args=(workflow_id, research_text, presentation_focus, filename_hint),
         daemon=True
     )
     thread.start()
     return thread
 
 
-def _run_ppt_generation_thread(workflow_id: int, research_text: str, topic: str):
-    """Background thread: triggers SlideSpeak + polls for PPT file."""
+def _run_ppt_generation_thread(
+    workflow_id: int,
+    research_text: str,
+    presentation_focus: str,
+    filename_hint: str | None = None
+):
+    """Background thread: runs SlideSpeak generation and persists workflow updates."""
     db = SessionLocal()
+    gen_step = None
     try:
         workflow = get_workflow_by_id(db, workflow_id)
+        if not workflow:
+            return
 
         # Create the generation step
         next_step_order = max((s.step_order for s in workflow.steps), default=0) + 1
@@ -594,7 +895,11 @@ def _run_ppt_generation_thread(workflow_id: int, research_text: str, topic: str)
             step_order=next_step_order,
             step_type="agent_generation",
             provider_type="agent",
-            input_data={"topic": topic, "research_preview": research_text[:500]}
+            input_data={
+                "presentation_focus_preview": (presentation_focus or "")[:1000],
+                "filename_hint": filename_hint,
+                "research_preview": research_text[:500]
+            }
         )
 
         update_workflow_status(db, workflow_id, "generating_ppt")
@@ -606,140 +911,67 @@ def _run_ppt_generation_thread(workflow_id: int, research_text: str, topic: str)
             message="SlideSpeak PPT generation started"
         )
 
-        # Build the SlideSpeak prompt (reusing the pattern from the existing generate-ppt endpoint)
-        sanitized_topic = topic.strip()[:100]
-        prompt = f"""You are tasked with creating a professional PowerPoint presentation. Follow these steps:
-
-STEP 1 - USE RESEARCH:
-You have already researched this topic. Here is a summary of your findings:
-
-{research_text[:2000]}
-
-STEP 2 - GENERATE POWERPOINT:
-Use the slidespeak skill to generate a PowerPoint presentation.
-
-Run this command from the slidespeak skill directory (/Users/anubhawmathur/.openclaw/workspace/skills/slidespeak):
-```bash
-cd /Users/anubhawmathur/.openclaw/workspace/skills/slidespeak && node scripts/slidespeak.mjs generate --text "Based on research: {research_text[:500]}. Create a professional presentation about: {sanitized_topic}" --length 8 --tone professional
-```
-
-STEP 3 - DOWNLOAD AND SAVE:
-After generation completes, the slidespeak script will return a request_id. Use it to download:
-```bash
-cd /Users/anubhawmathur/.openclaw/workspace/skills/slidespeak && node scripts/slidespeak.mjs download <request_id>
-```
-
-Download the file using curl and save it:
-```bash
-curl -L "<download_url>" -o "{PPT_OUTPUT_DIR}/{sanitized_topic.replace(' ', '_').lower()}.pptx"
-```
-
-Save the file ONLY to: {PPT_OUTPUT_DIR}
-Use a descriptive filename based on the topic."""
-
-        # Record the timestamp before triggering generation
-        start_timestamp = time.time()
-
-        # Trigger via webhook (fire-and-forget)
-        result = trigger_agent(
-            message=prompt,
-            name="SlideSpeak-PPT",
-            session_key=workflow.openclaw_session_id,
-            timeout_seconds=300,
-            thinking="medium"
+        ppt_result = _generate_ppt_via_slidespeak(
+            presentation_focus=presentation_focus,
+            research_text=research_text,
+            filename_hint=filename_hint
         )
 
-        if not result.get("success"):
-            error_msg = result.get("error", "Failed to trigger generation")
-            update_step_status(db, gen_step.id, "failed",
-                               output_data={"error": error_msg})
-            update_workflow_status(db, workflow_id, "failed")
-            create_event(
-                db, workflow_id=workflow_id, event_type="failed",
-                actor_type="agent", step_id=gen_step.id,
-                message=f"PPT generation trigger failed: {error_msg}"
-            )
+        # Guardrail: ignore late PPT completion if this run was cancelled/failed meanwhile.
+        current_workflow = get_workflow_by_id(db, workflow_id)
+        current_gen_step = get_step_by_id(db, gen_step.id) if gen_step else None
+        if (not current_workflow or current_workflow.status != "generating_ppt"
+                or not current_gen_step or current_gen_step.status == "failed"):
+            print(f"[Workflow {workflow_id}] PPT result ignored because workflow state changed.")
             return
 
-        # Poll for the PPT file (check every 5 seconds for up to 5 minutes)
-        print(f"[Workflow {workflow_id}] Polling for PPT file...")
-        max_attempts = 60
-        poll_interval = 5
-
-        for attempt in range(max_attempts):
-            time.sleep(poll_interval)
-
-            # Check for new .pptx files created after our start timestamp
-            if os.path.exists(PPT_OUTPUT_DIR):
-                for filename in os.listdir(PPT_OUTPUT_DIR):
-                    if filename.endswith('.pptx'):
-                        filepath = os.path.join(PPT_OUTPUT_DIR, filename)
-                        file_mtime = os.stat(filepath).st_mtime
-                        file_size = os.stat(filepath).st_size
-
-                        if file_mtime > start_timestamp and file_size > 0:
-                            # Found the generated file!
-                            print(f"[Workflow {workflow_id}] PPT found: {filename}")
-
-                            update_step_status(
-                                db, gen_step.id, "completed",
-                                output_data={
-                                    "file_name": filename,
-                                    "file_path": filepath,
-                                    "file_size": file_size,
-                                    "file_size_formatted": f"{file_size / 1024:.1f} KB",
-                                }
-                            )
-
-                            linked_request_id = None
-                            for step in workflow.steps:
-                                payload = step.input_data or {}
-                                if isinstance(payload, dict) and payload.get("request_id"):
-                                    linked_request_id = payload.get("request_id")
-                                    break
-                            if linked_request_id:
-                                linked_request = get_work_request_by_id(db, linked_request_id)
-                                if linked_request and linked_request.status != "completed":
-                                    linked_request.status = "completed"
-
-                            update_workflow_status(db, workflow_id, "completed")
-                            create_event(
-                                db, workflow_id=workflow_id,
-                                event_type="generation_completed",
-                                actor_type="agent", step_id=gen_step.id,
-                                message=f"PowerPoint generated: {filename}"
-                            )
-
-                            # Notify via Slack
-                            try:
-                                from slack_service import notify_ppt_complete
-                                notify_ppt_complete(workflow_id, topic, filename)
-                            except Exception:
-                                pass
-
-                            return
-
-            if attempt % 6 == 0 and attempt > 0:
-                print(f"[Workflow {workflow_id}] Still polling... ({attempt * poll_interval}s)")
-
-        # Timeout — no file found
         update_step_status(
-            db, gen_step.id, "failed",
-            output_data={"error": "Timed out waiting for PPT file"}
+            db, gen_step.id, "completed",
+            output_data=ppt_result
         )
-        update_workflow_status(db, workflow_id, "failed")
+
+        linked_request_id = None
+        for step in workflow.steps:
+            payload = step.input_data or {}
+            if isinstance(payload, dict) and payload.get("request_id"):
+                linked_request_id = payload.get("request_id")
+                break
+        if linked_request_id:
+            linked_request = get_work_request_by_id(db, linked_request_id)
+            if linked_request and linked_request.status != "completed":
+                linked_request.status = "completed"
+
+        update_workflow_status(db, workflow_id, "completed")
         create_event(
-            db, workflow_id=workflow_id, event_type="failed",
-            actor_type="system", step_id=gen_step.id,
-            message="PPT generation timed out after 5 minutes"
+            db, workflow_id=workflow_id,
+            event_type="generation_completed",
+            actor_type="agent", step_id=gen_step.id,
+            message=f"PowerPoint generated: {ppt_result['file_name']}"
         )
+
+        # Notify via Slack
+        try:
+            from slack_service import notify_ppt_complete
+            notify_ppt_complete(workflow_id, filename_hint or presentation_focus, ppt_result["file_name"])
+        except Exception:
+            pass
 
     except Exception as e:
-        print(f"[Workflow {workflow_id}] EXCEPTION in PPT generation thread: {e}")
+        error_msg = str(e) or "Unknown PPT generation error"
+        if isinstance(e, TimeoutError):
+            error_msg = f"PPT generation timed out after {SLIDESPEAK_MAX_WAIT_SECONDS // 60} minutes"
+        print(f"[Workflow {workflow_id}] EXCEPTION in PPT generation thread: {error_msg}")
         import traceback
         traceback.print_exc()
         try:
+            if gen_step:
+                update_step_status(db, gen_step.id, "failed", output_data={"error": error_msg})
             update_workflow_status(db, workflow_id, "failed")
+            create_event(
+                db, workflow_id=workflow_id, event_type="failed",
+                actor_type="system", step_id=gen_step.id if gen_step else None,
+                message=error_msg
+            )
         except Exception:
             pass
     finally:

@@ -25,7 +25,7 @@ const roleLabels: Record<string, string> = {
 const Header: React.FC<HeaderProps> = ({ currentUser, onSwitchPersona, onGoToMarketplace, onGoToDashboard, currentPage }) => {
   return (
     <nav className="w-full border-b border-[var(--color-border)]"
-      style={{ background: 'rgba(15, 22, 41, 0.85)', backdropFilter: 'blur(12px)' }}>
+      style={{ background: 'rgba(15, 22, 41, 0.95)' }}>
       <div className="w-full px-6 py-3">
         <div className="flex justify-between items-center max-w-7xl mx-auto">
           {/* Logo / Title */}
@@ -46,13 +46,13 @@ const Header: React.FC<HeaderProps> = ({ currentUser, onSwitchPersona, onGoToMar
           <div className="flex items-center gap-1">
             <button
               onClick={onGoToDashboard}
-              className={`px-4 py-2 text-sm font-medium rounded-lg transition-all ${currentPage === 'dashboard' || currentPage === 'detail' ? 'text-white bg-white/10' : 'text-[var(--color-text-secondary)] hover:text-white hover:bg-white/5'}`}
+              className={`px-4 py-2 text-sm font-medium rounded-lg ${currentPage === 'dashboard' || currentPage === 'detail' ? 'text-white bg-white/10' : 'text-[var(--color-text-secondary)]'}`}
             >
               My Workflows
             </button>
             <button
               onClick={onGoToMarketplace}
-              className={`px-4 py-2 text-sm font-medium rounded-lg transition-all ${currentPage === 'marketplace' || currentPage === 'marketplace-detail' ? 'text-white bg-white/10' : 'text-[var(--color-text-secondary)] hover:text-white hover:bg-white/5'}`}
+              className={`px-4 py-2 text-sm font-medium rounded-lg ${currentPage === 'marketplace' || currentPage === 'marketplace-detail' ? 'text-white bg-white/10' : 'text-[var(--color-text-secondary)]'}`}
             >
               Marketplace
             </button>

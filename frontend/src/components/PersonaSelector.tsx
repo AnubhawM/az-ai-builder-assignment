@@ -40,7 +40,6 @@ const roleLabels: Record<string, string> = {
 const PersonaSelector: React.FC<PersonaSelectorProps> = ({ onSelect }) => {
     const [users, setUsers] = useState<User[]>([]);
     const [loading, setLoading] = useState(true);
-    const [hoveredId, setHoveredId] = useState<number | null>(null);
 
     useEffect(() => {
         const fetchUsers = async () => {
@@ -69,7 +68,7 @@ const PersonaSelector: React.FC<PersonaSelectorProps> = ({ onSelect }) => {
 
     return (
         <div className="min-h-screen flex items-center justify-center px-6 py-12">
-            <div className="max-w-3xl w-full animate-fade-in">
+            <div className="max-w-3xl w-full">
                 {/* Header */}
                 <div className="text-center mb-12">
                     <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-purple-500 to-indigo-600 flex items-center justify-center text-white font-bold text-2xl mx-auto mb-6 shadow-lg shadow-purple-500/20">
@@ -87,24 +86,17 @@ const PersonaSelector: React.FC<PersonaSelectorProps> = ({ onSelect }) => {
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                     {users.map((user) => {
                         const config = roleConfig[user.role] || roleConfig.researcher;
-                        const isHovered = hoveredId === user.id;
 
                         return (
                             <button
                                 key={user.id}
                                 onClick={() => onSelect(user)}
-                                onMouseEnter={() => setHoveredId(user.id)}
-                                onMouseLeave={() => setHoveredId(null)}
-                                className="glass-card p-6 text-left cursor-pointer group"
-                                style={{
-                                    transform: isHovered ? 'translateY(-4px)' : 'translateY(0)',
-                                    transition: 'all 0.3s ease',
-                                }}
+                                className="glass-card p-6 text-left cursor-pointer"
                                 id={`persona-${user.role}`}
                             >
                                 {/* Avatar */}
                                 <div
-                                    className={`w-12 h-12 rounded-xl bg-gradient-to-br ${config.color} flex items-center justify-center text-2xl mb-4 shadow-md transition-transform duration-300 ${isHovered ? 'scale-110' : ''}`}
+                                    className={`w-12 h-12 rounded-xl bg-gradient-to-br ${config.color} flex items-center justify-center text-2xl mb-4 shadow-md`}
                                 >
                                     {config.icon}
                                 </div>
@@ -122,10 +114,7 @@ const PersonaSelector: React.FC<PersonaSelectorProps> = ({ onSelect }) => {
                                     {config.description}
                                 </p>
 
-                                {/* Hover indicator */}
-                                <div
-                                    className={`mt-4 flex items-center gap-1 text-xs font-medium transition-all duration-300 ${isHovered ? 'text-purple-400 opacity-100' : 'text-transparent opacity-0'}`}
-                                >
+                                <div className="mt-4 flex items-center gap-1 text-xs font-medium text-purple-400">
                                     Continue →
                                 </div>
                             </button>

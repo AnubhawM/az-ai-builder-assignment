@@ -107,8 +107,8 @@ const MarketplaceDetail: React.FC<MarketplaceDetailProps> = ({ requestId, curren
     const hasVolunteered = request.volunteers.some(v => v.user_id === currentUser.id);
 
     return (
-        <div className="max-w-4xl mx-auto px-6 py-8 animate-fade-in">
-            <button onClick={onBack} className="text-[var(--color-text-secondary)] hover:text-white mb-6 flex items-center gap-2 transition-colors">
+        <div className="max-w-4xl mx-auto px-6 py-8">
+            <button onClick={onBack} className="text-[var(--color-text-secondary)] mb-6 flex items-center gap-2">
                 ← Back to Marketplace
             </button>
 

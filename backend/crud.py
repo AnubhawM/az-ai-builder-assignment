@@ -150,6 +150,20 @@ def get_active_step(db: Session, workflow_id: int) -> WorkflowStep | None:
     )
 
 
+def get_active_step_by_type(db: Session, workflow_id: int, step_type: str) -> WorkflowStep | None:
+    """Get the most recent active step for a workflow by step_type."""
+    return (
+        db.query(WorkflowStep)
+        .filter(
+            WorkflowStep.workflow_id == workflow_id,
+            WorkflowStep.step_type == step_type,
+            WorkflowStep.status.in_(["pending", "in_progress", "awaiting_input"])
+        )
+        .order_by(WorkflowStep.step_order.desc(), WorkflowStep.id.desc())
+        .first()
+    )
+
+
 def update_step_status(db: Session, step_id: int, status: str,
                         output_data: dict = None,
                         feedback: str = None) -> WorkflowStep | None:
@@ -194,9 +208,11 @@ def create_event(db: Session, workflow_id: int, event_type: str,
         metadata_json=metadata_json,
     )
     db.add(event)
+    db.flush()  # assign PK before commit so we can fetch safely afterward
+    event_id = event.id
     db.commit()
-    db.refresh(event)
-    return event
+    # Avoid refresh-related identity-map conflicts; fetch by id after commit.
+    return db.get(WorkflowEvent, event_id) or event
 
 
 def get_events_for_workflow(db: Session, workflow_id: int) -> list[WorkflowEvent]:

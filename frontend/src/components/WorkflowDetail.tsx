@@ -132,7 +132,9 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
     const [sendingMessage, setSendingMessage] = useState(false);
     const [updatingCompletion, setUpdatingCompletion] = useState(false);
     const [triggeringResearch, setTriggeringResearch] = useState(false);
-    const [triggeringGeneration, setTriggeringGeneration] = useState(false);
+    const [retryingGeneration, setRetryingGeneration] = useState(false);
+    const [cancellingRun, setCancellingRun] = useState(false);
+    const [retryingRun, setRetryingRun] = useState(false);
     const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({
         summary: true,
         outline: true,
@@ -234,20 +236,51 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
         }
     };
 
-    const handleGenerateFromChat = async () => {
-        if (triggeringGeneration) return;
-        setTriggeringGeneration(true);
+    const handleRetryPpt = async () => {
+        if (retryingGeneration) return;
+        setRetryingGeneration(true);
         try {
-            await axios.post(`${import.meta.env.VITE_API_URL}/api/workflows/${workflowId}/generate-ppt`, {
+            await axios.post(`${import.meta.env.VITE_API_URL}/api/workflows/${workflowId}/retry-ppt`, {
                 user_id: currentUser.id,
-                instructions: chatInput.trim() || undefined
             });
             fetchWorkflow();
         } catch (err: any) {
-            console.error('Failed to trigger generation from chat:', err);
-            alert(err.response?.data?.error || 'Failed to trigger PPT generation');
+            console.error('Failed to retry PPT generation:', err);
+            alert(err.response?.data?.error || 'Failed to retry PPT generation');
         } finally {
-            setTriggeringGeneration(false);
+            setRetryingGeneration(false);
+        }
+    };
+
+    const handleCancelRun = async () => {
+        if (cancellingRun) return;
+        setCancellingRun(true);
+        try {
+            await axios.post(`${import.meta.env.VITE_API_URL}/api/workflows/${workflowId}/cancel-run`, {
+                user_id: currentUser.id,
+            });
+            fetchWorkflow();
+        } catch (err: any) {
+            console.error('Failed to cancel active run:', err);
+            alert(err.response?.data?.error || 'Failed to cancel active run');
+        } finally {
+            setCancellingRun(false);
+        }
+    };
+
+    const handleRetryRun = async () => {
+        if (retryingRun) return;
+        setRetryingRun(true);
+        try {
+            await axios.post(`${import.meta.env.VITE_API_URL}/api/workflows/${workflowId}/retry-run`, {
+                user_id: currentUser.id,
+            });
+            fetchWorkflow();
+        } catch (err: any) {
+            console.error('Failed to retry run:', err);
+            alert(err.response?.data?.error || 'Failed to retry run');
+        } finally {
+            setRetryingRun(false);
         }
     };
 
@@ -298,9 +331,12 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
     const generationStep = workflow.steps
         .filter(s => s.step_type === 'agent_generation')
         .slice(-1)[0];
+    const generationError = generationStep?.output_data?.error as string | undefined;
+    const isGenerationFailed = generationStep?.status === 'failed';
 
     const isAwaitingReview = workflow.status === 'awaiting_review';
     const isProcessing = ['researching', 'refining', 'generating_ppt', 'pending'].includes(workflow.status);
+    const isActiveRun = ['researching', 'refining', 'generating_ppt'].includes(workflow.status);
     const hasAgentParticipant = workflow.steps.some(
         s => s.assignee?.is_agent || s.provider_type === 'agent'
     );
@@ -312,6 +348,15 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
         && requiresResearch
         && !researchStep
         && currentUser.id === workflow.user_id;
+    const latestFailedEvent = [...workflow.events]
+        .reverse()
+        .find(event => event.event_type === 'failed');
+    const latestFailureMessage = latestFailedEvent?.message;
+    const canCancelRun = isActiveRun && currentUser.id === workflow.user_id;
+    const canRetryRun = workflow.status === 'failed'
+        && hasAgentParticipant
+        && currentUser.id === workflow.user_id
+        && !isGenerationFailed;
 
     const humanApprovals = workflow.approvals.filter(a => !a.user?.is_agent);
     const currentApproval = humanApprovals.find(a => a.user_id === currentUser.id);
@@ -319,7 +364,7 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
     const canUseCompletion = humanApprovals.length >= 2 && humanApprovals.some(a => a.user_id === currentUser.id);
 
     return (
-        <div className="max-w-6xl mx-auto px-6 py-8 animate-fade-in">
+        <div className="max-w-6xl mx-auto px-6 py-8">
             <div className="flex items-center gap-4 mb-6">
                 <button onClick={onBack} className="btn btn-ghost text-sm" id="back-btn">
                     ← Dashboard
@@ -490,6 +535,62 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                         </div>
                     )}
 
+                    {isGenerationFailed && (
+                        <div className="glass-card p-6 border-red-500/30">
+                            <h3 className="text-white font-semibold mb-2">❌ PPT Generation Failed</h3>
+                            <p className="text-sm text-[var(--color-text-secondary)]">
+                                {generationError || 'The presentation was not generated successfully.'}
+                            </p>
+                            <button
+                                onClick={handleRetryPpt}
+                                disabled={retryingGeneration || workflow.status === 'generating_ppt'}
+                                className="btn btn-outline mt-4 w-full"
+                            >
+                                {retryingGeneration ? 'Retrying...' : '↻ Retry PPT Generation'}
+                            </button>
+                        </div>
+                    )}
+
+                    {workflow.status === 'failed' && !isGenerationFailed && (
+                        <div className="glass-card p-6 border-red-500/30">
+                            <h3 className="text-white font-semibold mb-2">❌ Workflow Run Failed</h3>
+                            <p className="text-sm text-[var(--color-text-secondary)]">
+                                {latestFailureMessage || 'The workflow run failed before completion.'}
+                            </p>
+                        </div>
+                    )}
+
+                    {(canCancelRun || canRetryRun) && (
+                        <div className="glass-card p-6 border-amber-500/30">
+                            <h3 className="text-white font-semibold mb-2">🛠 Run Controls</h3>
+                            <p className="text-sm text-[var(--color-text-secondary)]">
+                                {canCancelRun
+                                    ? 'Cancel the current run if it appears stuck.'
+                                    : 'Retry the failed run without restarting the full workflow loop.'}
+                            </p>
+                            <div className="flex flex-col gap-2 mt-4">
+                                {canCancelRun && (
+                                    <button
+                                        onClick={handleCancelRun}
+                                        disabled={cancellingRun}
+                                        className="btn btn-outline w-full"
+                                    >
+                                        {cancellingRun ? 'Cancelling...' : '⛔ Cancel Current Run'}
+                                    </button>
+                                )}
+                                {canRetryRun && (
+                                    <button
+                                        onClick={handleRetryRun}
+                                        disabled={retryingRun}
+                                        className="btn btn-success w-full"
+                                    >
+                                        {retryingRun ? 'Retrying...' : '↻ Retry Run'}
+                                    </button>
+                                )}
+                            </div>
+                        </div>
+                    )}
+
                     {isAwaitingReview && (
                         <div className="glass-card p-6 border-purple-500/30" id="review-panel">
                             <h3 className="text-white font-semibold mb-4 flex items-center gap-2">
@@ -515,7 +616,7 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                                     value={feedback}
                                     onChange={(e) => setFeedback(e.target.value)}
                                     placeholder="e.g., Please add more data about cost analysis and include recent statistics..."
-                                    className="w-full bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg px-4 py-3 text-white text-sm placeholder:text-[var(--color-text-muted)] focus:outline-none focus:border-purple-500 transition-colors resize-none"
+                                    className="w-full bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg px-4 py-3 text-white text-sm placeholder:text-[var(--color-text-muted)] focus:outline-none focus:border-purple-500 resize-none"
                                     rows={3}
                                     disabled={submitting}
                                     id="feedback-input"
@@ -581,7 +682,7 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                                 onChange={(e) => setChatInput(e.target.value)}
                                 placeholder="Write a message for your collaborator..."
                                 rows={2}
-                                className="flex-1 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg px-4 py-2 text-white text-sm placeholder:text-[var(--color-text-muted)] focus:outline-none focus:border-purple-500 transition-colors resize-none"
+                                className="flex-1 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg px-4 py-2 text-white text-sm placeholder:text-[var(--color-text-muted)] focus:outline-none focus:border-purple-500 resize-none"
                                 disabled={sendingMessage}
                             />
                             <button
@@ -603,15 +704,6 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                             </button>
                         )}
 
-                        {hasAgentParticipant && (
-                            <button
-                                onClick={handleGenerateFromChat}
-                                disabled={triggeringGeneration || workflow.status === 'generating_ppt'}
-                                className="btn btn-outline mt-3 w-full"
-                            >
-                                {triggeringGeneration ? 'Starting...' : '📊 Generate PPT From Chat Context'}
-                            </button>
-                        )}
                     </div>
 
                     {canUseCompletion && (
@@ -652,11 +744,10 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                             {workflow.events.length === 0 ? (
                                 <p className="text-[var(--color-text-muted)] text-sm">No events yet.</p>
                             ) : (
-                                [...workflow.events].reverse().map((event, idx) => (
+                                [...workflow.events].reverse().map((event) => (
                                     <div
                                         key={event.id}
-                                        className="flex gap-3 py-3 border-b border-[var(--color-border)] last:border-0 animate-slide-in"
-                                        style={{ animationDelay: `${idx * 30}ms` }}
+                                        className="flex gap-3 py-3 border-b border-[var(--color-border)] last:border-0"
                                     >
                                         <div className="text-base flex-shrink-0 mt-0.5">
                                             {eventIcons[event.event_type] || '📌'}

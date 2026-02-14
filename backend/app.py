@@ -6,7 +6,6 @@ import time
 from dotenv import load_dotenv
 import requests
 from openclaw_client import ask_openclaw
-from openclaw_webhook_client import trigger_agent
 from workflow_routes import workflow_bp
 
 # Load environment variables from .env file inside backend folder
@@ -17,7 +16,7 @@ load_dotenv(dotenv_path=env_path)
 app = Flask(__name__)
 
 # PowerPoint output directory
-PPT_OUTPUT_DIR = "/Users/anubhawmathur/development/ppt-output"
+PPT_OUTPUT_DIR = os.getenv("PPT_OUTPUT_DIR", "/Users/anubhawmathur/development/ppt-output")
 
 # Ensure output directory exists
 os.makedirs(PPT_OUTPUT_DIR, exist_ok=True)
@@ -176,104 +175,15 @@ def research():
 @app.route('/generate-ppt', methods=['POST'])
 def generate_ppt():
     """
-    Generate a PowerPoint presentation using OpenClaw webhooks.
-    Uses the /hooks/agent endpoint to trigger OpenClaw with SlideSpeak skill.
+    Deprecated endpoint.
+    PPT generation is handled by the workflow API:
+    POST /api/workflows/<workflow_id>/generate-ppt
     """
-    try:
-        data = request.json
-        topic = data.get('topic')
-        
-        if not topic:
-            return jsonify({'error': 'Topic is required'}), 400
-
-        # Sanitize the topic for filename generation
-        sanitized_topic = topic.strip()[:100]  # Limit topic length for filename
-
-        # Craft a comprehensive prompt that instructs OpenClaw to:
-        # 1. Research the topic using web_search
-        # 2. Generate a PowerPoint using the slidespeak skill
-        # 3. Save it with a meaningful filename to the output directory
-        prompt = f"""You are tasked with creating a professional PowerPoint presentation. Follow these steps:
-
-STEP 1 - RESEARCH:
-Use web_search to research this topic thoroughly: "{sanitized_topic}"
-
-Gather key facts, statistics, and insights that would make a compelling presentation.
-
-STEP 2 - GENERATE POWERPOINT:
-After researching, use the slidespeak skill to generate a PowerPoint presentation.
-
-Run this command from the slidespeak skill directory (/Users/anubhawmathur/.openclaw/workspace/skills/slidespeak):
-```bash
-cd /Users/anubhawmathur/.openclaw/workspace/skills/slidespeak && node scripts/slidespeak.mjs generate --text "Based on my research: [INCLUDE YOUR RESEARCH FINDINGS HERE]. Create a professional presentation about: {sanitized_topic}" --length 8 --tone professional
-```
-
-STEP 3 - DOWNLOAD AND SAVE:
-After generation completes, the slidespeak script will return a request_id. Use it to download:
-```bash
-cd /Users/anubhawmathur/.openclaw/workspace/skills/slidespeak && node scripts/slidespeak.mjs download <request_id>
-```
-
-This will return a download URL. Download the file using curl and save it with a meaningful filename based on the topic:
-```bash
-curl -L "<download_url>" -o "{PPT_OUTPUT_DIR}/<meaningful_filename>.pptx"
-```
-
-IMPORTANT REQUIREMENTS:
-- The filename should be descriptive and based on the topic (use underscores for spaces, lowercase)
-- Example: "sustainable_energy_future.pptx" or "ai_healthcare_revolution.pptx"
-- Save the file ONLY to this directory: {PPT_OUTPUT_DIR}
-- Report back the exact filename you used
-
-When you're done, provide a brief summary of:
-1. What you researched
-2. The filename you saved the PowerPoint as
-3. The full path to the saved file"""
-
-        print(f"Triggering OpenClaw webhook for PowerPoint generation...")
-        print(f"Topic: {sanitized_topic}")
-        print(f"Output directory: {PPT_OUTPUT_DIR}")
-
-        # Use the webhook API to trigger the agent
-        result = trigger_agent(
-            message=prompt,
-            name="SlideSpeak-PPT",
-            session_key=f"ppt-gen-{int(time.time())}",
-            timeout_seconds=300,  # 5 minutes for research + generation
-            thinking="medium"
-        )
-
-        if not result.get("success"):
-            print(f"Webhook trigger failed: {result.get('error', 'Unknown error')}")
-            return jsonify({
-                'error': 'Failed to trigger PowerPoint generation',
-                'details': result.get('error', ''),
-                'status': 'error',
-                'output_directory': PPT_OUTPUT_DIR
-            }), 500
-
-        # The webhook API returns 202 for async runs
-        # The task is now running in the background
-        # Include timestamp so frontend can poll for files created after this time
-        start_timestamp = time.time()
-        
-        return jsonify({
-            'message': 'PowerPoint generation started! OpenClaw is researching your topic and generating the presentation. This typically takes 1-2 minutes.',
-            'output_directory': PPT_OUTPUT_DIR,
-            'status': 'pending',
-            'start_timestamp': start_timestamp,
-            'note': 'Check the output directory for your generated PowerPoint file.'
-        }), 202
-
-    except Exception as e:
-        print(f"Error generating PowerPoint: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({
-            'error': str(e),
-            'status': 'error',
-            'output_directory': PPT_OUTPUT_DIR
-        }), 500
+    return jsonify({
+        'error': 'Deprecated endpoint. Use workflow endpoints instead.',
+        'next_step': 'Use POST /api/workflows/<workflow_id>/generate-ppt with user_id.',
+        'status': 'error'
+    }), 410
 
 
 @app.route('/check-ppt-status', methods=['GET'])
@@ -392,4 +302,3 @@ def open_output_dir():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
-

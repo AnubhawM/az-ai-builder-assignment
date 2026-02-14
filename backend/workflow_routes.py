@@ -11,6 +11,8 @@ Endpoints:
     POST /api/workflows/<id>/messages — Post workflow chat message
     POST /api/workflows/<id>/completion — Mark/reopen collaborative completion
     POST /api/workflows/<id>/generate-ppt — Trigger PPT from chat context
+    POST /api/workflows/<id>/cancel-run — Cancel an active run
+    POST /api/workflows/<id>/retry-run — Retry a failed/stalled run
     POST /api/slack/interactions     — Handle inbound Slack button clicks
 """
 
@@ -20,6 +22,7 @@ import time
 import hmac
 import hashlib
 import threading
+from datetime import datetime, timezone
 from flask import Blueprint, request, jsonify
 
 from database import SessionLocal
@@ -47,6 +50,20 @@ from workflow_service import (
 workflow_bp = Blueprint('workflows', __name__)
 
 SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET", "")
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+RUNNING_WORKFLOW_STATUSES = {"researching", "refining", "generating_ppt"}
+RUN_STALE_TIMEOUT_SECONDS = max(180, _env_int("WORKFLOW_RUN_STALE_TIMEOUT_SECONDS", 330))
 
 
 def _normalize_caps(capabilities: list[str] | None) -> list[str]:
@@ -90,6 +107,185 @@ def _has_agent_participant(workflow) -> bool:
         if step.provider_type == "agent":
             return True
     return False
+
+
+def _get_request_description(workflow) -> str:
+    """Return requester description captured in step input payloads."""
+    ordered_steps = sorted(
+        workflow.steps,
+        key=lambda step: ((step.step_order or 0), (step.id or 0))
+    )
+    for step in ordered_steps:
+        payload = step.input_data or {}
+        if not isinstance(payload, dict):
+            continue
+        desc = payload.get("description")
+        if isinstance(desc, str) and desc.strip():
+            return desc.strip()
+    return ""
+
+
+def _get_primary_focus(workflow) -> str:
+    """
+    Description-first focus for both research and PPT generation.
+    Falls back to title when no description exists.
+    """
+    description = _get_request_description(workflow)
+    return description or (workflow.title or "").strip()
+
+
+def _as_utc(dt: datetime | None) -> datetime | None:
+    if not dt:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _get_latest_step_by_type(workflow, step_type: str):
+    matches = [step for step in workflow.steps if step.step_type == step_type]
+    if not matches:
+        return None
+    matches.sort(key=lambda step: ((step.step_order or 0), (step.id or 0)))
+    return matches[-1]
+
+
+def _get_latest_research_step_with_output(workflow):
+    ordered_steps = sorted(
+        workflow.steps,
+        key=lambda step: ((step.step_order or 0), (step.id or 0))
+    )
+    for step in reversed(ordered_steps):
+        if step.step_type == "agent_research" and isinstance(step.output_data, dict) and step.output_data:
+            return step
+    return None
+
+
+def _get_operation_step_for_status(workflow):
+    if workflow.status in ("researching", "refining"):
+        return _get_latest_step_by_type(workflow, "agent_research")
+    if workflow.status == "generating_ppt":
+        return _get_latest_step_by_type(workflow, "agent_generation")
+    return None
+
+
+def _build_chat_context(workflow, limit: int = 12) -> str:
+    recent_messages = workflow.messages[-limit:] if workflow.messages else []
+    context_lines = []
+    for msg in recent_messages:
+        if msg.sender_type == "system":
+            speaker = "System"
+        elif msg.sender and msg.sender.name:
+            speaker = msg.sender.name
+        elif msg.sender_type == "agent":
+            speaker = "OpenClaw"
+        else:
+            speaker = "Human"
+        context_lines.append(f"{speaker}: {msg.message}")
+    return "\n".join(context_lines)
+
+
+def _get_recent_refinement_feedback(workflow, limit: int = 6) -> list[str]:
+    feedback_items: list[str] = []
+    ordered_events = sorted(
+        workflow.events,
+        key=lambda event: ((event.created_at or datetime.min), (event.id or 0))
+    )
+    for event in ordered_events:
+        if event.event_type != "refined":
+            continue
+        message = (event.message or "").strip()
+        if not message:
+            continue
+        if ":" in message:
+            message = message.split(":", 1)[1].strip()
+        if message:
+            feedback_items.append(message)
+    return feedback_items[-limit:]
+
+
+def _build_generation_research_context(workflow, research_step, include_chat: bool = True) -> str:
+    payload = research_step.output_data if research_step and isinstance(research_step.output_data, dict) else {}
+    sections: list[str] = []
+
+    summary = (payload.get("summary") or "").strip()
+    slide_outline = (payload.get("slide_outline") or "").strip()
+    raw_research = (payload.get("raw_research") or "").strip()
+
+    if summary:
+        sections.append(f"EXECUTIVE SUMMARY:\n{summary}")
+    if slide_outline:
+        sections.append(f"SLIDE OUTLINE (TARGET STRUCTURE):\n{slide_outline}")
+    if raw_research:
+        sections.append(f"RAW RESEARCH DETAILS:\n{raw_research}")
+
+    refinement_feedback = _get_recent_refinement_feedback(workflow)
+    if refinement_feedback:
+        sections.append(
+            "REFINEMENT REQUIREMENTS (MUST BE SATISFIED):\n"
+            + "\n".join(f"- {item}" for item in refinement_feedback)
+        )
+
+    if include_chat:
+        chat_context = _build_chat_context(workflow, limit=14)
+        if chat_context:
+            sections.append(f"COLLABORATION CHAT CONTEXT:\n{chat_context}")
+
+    if not sections:
+        return _get_primary_focus(workflow)
+    return "\n\n".join(sections)
+
+
+def _maybe_fail_stalled_workflow(db, workflow):
+    """
+    Auto-fail stale runs so UI/actions never stay stuck indefinitely.
+    Triggered opportunistically during normal API reads/writes.
+    """
+    if not workflow or workflow.status not in RUNNING_WORKFLOW_STATUSES:
+        return workflow
+
+    updated_at = _as_utc(workflow.updated_at)
+    if not updated_at:
+        return workflow
+
+    elapsed_seconds = (datetime.now(timezone.utc) - updated_at).total_seconds()
+    if elapsed_seconds < RUN_STALE_TIMEOUT_SECONDS:
+        return workflow
+
+    timeout_minutes = max(1, RUN_STALE_TIMEOUT_SECONDS // 60)
+    stale_message = (
+        f"{workflow.status.replace('_', ' ').title()} timed out after "
+        f"{timeout_minutes} minutes with no progress."
+    )
+    op_step = _get_operation_step_for_status(workflow)
+    if op_step and op_step.status in ("pending", "in_progress", "awaiting_input"):
+        existing_output = op_step.output_data if isinstance(op_step.output_data, dict) else {}
+        failed_output = {
+            **existing_output,
+            "error": stale_message,
+            "timed_out": True,
+        }
+        update_step_status(db, op_step.id, "failed", output_data=failed_output)
+
+    update_workflow_status(db, workflow.id, "failed")
+    create_workflow_message(
+        db,
+        workflow_id=workflow.id,
+        sender_type="system",
+        channel="system",
+        message=f"{stale_message} Marked as failed automatically. You can retry the run."
+    )
+    create_event(
+        db, workflow_id=workflow.id, event_type="failed",
+        actor_type="system", step_id=op_step.id if op_step else None,
+        channel="system",
+        message=stale_message,
+        metadata_json={
+            "timed_out": True,
+            "timeout_seconds": RUN_STALE_TIMEOUT_SECONDS,
+        }
+    )
+    return get_workflow_by_id(db, workflow.id)
 
 
 # ──────────────────────────────────────
@@ -170,7 +366,12 @@ def create_new_workflow():
         )
 
         # Start research in a background thread
-        start_research(workflow.id, topic, session_id)
+        start_research(
+            workflow.id,
+            topic,
+            session_id,
+            research_step_id=research_step.id
+        )
 
         return jsonify({
             "message": "Workflow created! Research is starting...",
@@ -205,6 +406,7 @@ def list_workflows():
 
         workflow_payload = []
         for workflow in workflows:
+            workflow = _maybe_fail_stalled_workflow(db, workflow)
             data = workflow.to_dict()
             # Keep list payload lightweight for polling-heavy dashboard views.
             data.pop("messages", None)
@@ -232,6 +434,7 @@ def get_workflow_detail(workflow_id):
             return jsonify({"error": "Workflow not found"}), 404
         if user_id not in _participant_user_ids(workflow):
             return jsonify({"error": "User is not a participant in this workflow"}), 403
+        workflow = _maybe_fail_stalled_workflow(db, workflow)
 
         return jsonify({
             "workflow": workflow.to_dict()
@@ -280,26 +483,22 @@ def submit_review(workflow_id):
         if not workflow:
             return jsonify({"error": "Workflow not found"}), 404
 
-        if workflow.status not in ("awaiting_review",):
-            return jsonify({
-                "error": f"Workflow is not awaiting review (current status: {workflow.status})"
-            }), 400
-
         # Get the reviewer user
         user = get_user_by_id(db, user_id)
         if not user:
             return jsonify({"error": "User not found"}), 404
         if user_id not in _participant_user_ids(workflow):
             return jsonify({"error": "User is not a participant in this workflow"}), 403
+        workflow = _maybe_fail_stalled_workflow(db, workflow)
 
-        # Find the research step to get the accumulated research
-        research_step = None
-        review_step = None
-        for step in workflow.steps:
-            if step.step_type == "agent_research":
-                research_step = step
-            if step.step_type == "human_review":
-                review_step = step
+        if workflow.status not in ("awaiting_review",):
+            return jsonify({
+                "error": f"Workflow is not awaiting review (current status: {workflow.status})"
+            }), 400
+
+        # Find latest research output and current review step.
+        research_step = _get_latest_research_step_with_output(workflow)
+        review_step = _get_latest_step_by_type(workflow, "human_review")
 
         if not research_step or not research_step.output_data:
             return jsonify({"error": "No research data found"}), 400
@@ -320,12 +519,17 @@ def submit_review(workflow_id):
                 message=f"Research approved by {user.name}"
             )
 
-            # Extract research text for PPT generation
-            research_data = research_step.output_data
-            research_text = research_data.get("raw_research") or research_data.get("summary") or ""
+            # Build rich research+outline+refinement context for PPT generation.
+            research_text = _build_generation_research_context(workflow, research_step)
+            presentation_focus = _get_primary_focus(workflow)
 
             # Start PPT generation in background thread
-            start_ppt_generation(workflow_id, research_text, workflow.title)
+            start_ppt_generation(
+                workflow_id,
+                research_text,
+                presentation_focus,
+                filename_hint=workflow.title
+            )
 
             return jsonify({
                 "message": f"Research approved by {user.name}! PowerPoint generation starting...",
@@ -334,6 +538,8 @@ def submit_review(workflow_id):
 
         elif action == "refine":
             # ── REFINE: Log feedback, restart research with context ──
+            if review_step:
+                update_step_status(db, review_step.id, "completed", feedback=feedback)
 
             # Log the refinement event
             create_event(
@@ -570,6 +776,7 @@ def start_research_from_collaboration(workflow_id):
             return jsonify({"error": "Workflow not found"}), 404
         if user_id not in _participant_user_ids(workflow):
             return jsonify({"error": "User is not a participant in this workflow"}), 403
+        workflow = _maybe_fail_stalled_workflow(db, workflow)
         if user_id != workflow.user_id:
             return jsonify({"error": "Only the requester can start research"}), 403
         if workflow.status != "collaborating":
@@ -582,44 +789,33 @@ def start_research_from_collaboration(workflow_id):
                 return jsonify({"error": "Research has already started for this workflow"}), 400
 
         active_step = get_active_step(db, workflow_id)
-        request_description = ""
-        if active_step and isinstance(active_step.input_data, dict):
-            request_description = (active_step.input_data.get("description") or "").strip()
-            if active_step.status in ("pending", "in_progress", "awaiting_input"):
-                update_step_status(db, active_step.id, "completed")
+        if active_step and active_step.status in ("pending", "in_progress", "awaiting_input"):
+            update_step_status(db, active_step.id, "completed")
 
-        recent_messages = workflow.messages[-12:] if workflow.messages else []
-        context_lines = []
-        for msg in recent_messages:
-            if msg.sender_type == "system":
-                speaker = "System"
-            elif msg.sender and msg.sender.name:
-                speaker = msg.sender.name
-            elif msg.sender_type == "agent":
-                speaker = "OpenClaw"
-            else:
-                speaker = "Human"
-            context_lines.append(f"{speaker}: {msg.message}")
-        chat_context = "\n".join(context_lines)
-        if chat_context:
-            request_description = "\n\n".join(
-                part for part in [request_description, f"Collaboration context:\n{chat_context}"] if part
-            )
+        chat_context = _build_chat_context(workflow)
+        base_description = _get_request_description(workflow)
+        research_context = "\n\n".join(
+            part for part in [
+                base_description,
+                f"Collaboration context:\n{chat_context}" if chat_context else "",
+            ] if part
+        )
+        research_focus = base_description or (workflow.title or "").strip()
 
         session_id = workflow.openclaw_session_id or f"workflow-{generate_session_id()}"
         if not workflow.openclaw_session_id:
             update_workflow_status(db, workflow_id, workflow.status, openclaw_session_id=session_id)
 
         next_step_order = max((s.step_order for s in workflow.steps), default=0) + 1
-        create_workflow_step(
+        research_step = create_workflow_step(
             db,
             workflow_id=workflow_id,
             step_order=next_step_order,
             step_type="agent_research",
             provider_type="agent",
             input_data={
-                "topic": workflow.title,
-                "description": request_description
+                "topic": research_focus,
+                "description": research_context
             }
         )
 
@@ -638,9 +834,10 @@ def start_research_from_collaboration(workflow_id):
 
         start_research(
             workflow_id,
-            workflow.title,
+            research_focus,
             session_id,
-            request_description=request_description
+            request_description=research_context,
+            research_step_id=research_step.id
         )
 
         return jsonify({
@@ -666,36 +863,37 @@ def generate_ppt_from_workflow_chat(workflow_id):
         workflow = get_workflow_by_id(db, workflow_id)
         if not workflow:
             return jsonify({"error": "Workflow not found"}), 404
-        if workflow.status == "generating_ppt":
-            return jsonify({"error": "PPT generation is already in progress"}), 400
 
         user = get_user_by_id(db, user_id)
         if not user:
             return jsonify({"error": "User not found"}), 404
         if user_id not in _participant_user_ids(workflow):
             return jsonify({"error": "User is not a participant in this workflow"}), 403
+        workflow = _maybe_fail_stalled_workflow(db, workflow)
+        if workflow.status == "generating_ppt":
+            return jsonify({"error": "PPT generation is already in progress"}), 400
         if not _has_agent_participant(workflow):
             return jsonify({"error": "No agent collaborator is assigned to this workflow"}), 400
 
-        recent_messages = workflow.messages[-12:] if workflow.messages else []
-        context_lines = []
-        for msg in recent_messages:
-            if msg.sender_type == "system":
-                speaker = "System"
-            elif msg.sender and msg.sender.name:
-                speaker = msg.sender.name
-            elif msg.sender_type == "agent":
-                speaker = "OpenClaw"
-            else:
-                speaker = "Human"
-            context_lines.append(f"{speaker}: {msg.message}")
-        chat_context = "\n".join(context_lines)
+        chat_context = _build_chat_context(workflow)
+        research_step = _get_latest_research_step_with_output(workflow)
+        research_context = _build_generation_research_context(
+            workflow,
+            research_step,
+            include_chat=False
+        ) if research_step else ""
 
+        presentation_focus = _get_primary_focus(workflow)
         combined_instructions = "\n\n".join(
-            part for part in [instructions, f"Chat context:\n{chat_context}"] if part
+            part for part in [
+                research_context,
+                f"Requester brief:\n{presentation_focus}" if presentation_focus else "",
+                f"Additional generation instructions:\n{instructions}" if instructions else "",
+                f"Chat context:\n{chat_context}" if chat_context else "",
+            ] if part
         )
         if not combined_instructions.strip():
-            combined_instructions = workflow.title
+            combined_instructions = presentation_focus or workflow.title
 
         create_workflow_message(
             db,
@@ -710,10 +908,265 @@ def generate_ppt_from_workflow_chat(workflow_id):
             message=f"{user.name} requested PPT generation from collaboration chat"
         )
 
-        start_ppt_generation(workflow_id, combined_instructions, workflow.title)
+        start_ppt_generation(
+            workflow_id,
+            combined_instructions,
+            presentation_focus or workflow.title,
+            filename_hint=workflow.title
+        )
 
         return jsonify({
             "message": "PPT generation started from workflow chat context.",
+            "workflow": get_workflow_by_id(db, workflow_id).to_dict()
+        }), 202
+    finally:
+        db.close()
+
+
+@workflow_bp.route('/api/workflows/<int:workflow_id>/retry-ppt', methods=['POST'])
+def retry_failed_ppt_generation(workflow_id):
+    """Retry PPT generation using existing workflow research output."""
+    db = SessionLocal()
+    try:
+        data = request.json or {}
+        user_id = data.get("user_id")
+        if not user_id:
+            return jsonify({"error": "user_id is required"}), 400
+
+        workflow = get_workflow_by_id(db, workflow_id)
+        if not workflow:
+            return jsonify({"error": "Workflow not found"}), 404
+
+        user = get_user_by_id(db, user_id)
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+        if user_id not in _participant_user_ids(workflow):
+            return jsonify({"error": "User is not a participant in this workflow"}), 403
+        workflow = _maybe_fail_stalled_workflow(db, workflow)
+        if workflow.status == "generating_ppt":
+            return jsonify({"error": "PPT generation is already in progress"}), 400
+
+        latest_generation_step = None
+        for step in workflow.steps:
+            if step.step_type == "agent_generation":
+                latest_generation_step = step
+        if not latest_generation_step or latest_generation_step.status != "failed":
+            return jsonify({"error": "No failed PPT generation step found to retry"}), 400
+
+        research_step = _get_latest_research_step_with_output(workflow)
+        if not research_step:
+            return jsonify({"error": "No completed research output found for retry"}), 400
+
+        presentation_focus = _get_primary_focus(workflow)
+        research_text = _build_generation_research_context(workflow, research_step)
+
+        create_workflow_message(
+            db,
+            workflow_id=workflow_id,
+            sender_type="system",
+            channel="system",
+            message=f"{user.name} retried PPT generation after a failed attempt."
+        )
+        create_event(
+            db, workflow_id=workflow_id, event_type="generation_requested",
+            actor_id=user_id, actor_type="human", channel="web",
+            message=f"{user.name} retried PPT generation"
+        )
+
+        start_ppt_generation(
+            workflow_id,
+            research_text,
+            presentation_focus or workflow.title,
+            filename_hint=workflow.title
+        )
+
+        return jsonify({
+            "message": "PPT generation retry started.",
+            "workflow": get_workflow_by_id(db, workflow_id).to_dict()
+        }), 202
+    finally:
+        db.close()
+
+
+@workflow_bp.route('/api/workflows/<int:workflow_id>/cancel-run', methods=['POST'])
+def cancel_active_run(workflow_id):
+    """Cancel an in-flight research/refinement/PPT run and mark it failed."""
+    db = SessionLocal()
+    try:
+        data = request.json or {}
+        user_id = data.get("user_id")
+        reason = str(data.get("reason", "")).strip()
+        if not user_id:
+            return jsonify({"error": "user_id is required"}), 400
+
+        workflow = get_workflow_by_id(db, workflow_id)
+        if not workflow:
+            return jsonify({"error": "Workflow not found"}), 404
+
+        user = get_user_by_id(db, user_id)
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+        if user_id not in _participant_user_ids(workflow):
+            return jsonify({"error": "User is not a participant in this workflow"}), 403
+        workflow = _maybe_fail_stalled_workflow(db, workflow)
+        if user_id != workflow.user_id:
+            return jsonify({"error": "Only the requester can cancel an active run"}), 403
+
+        if workflow.status not in RUNNING_WORKFLOW_STATUSES:
+            return jsonify({
+                "error": f"No active run to cancel (current status: {workflow.status})"
+            }), 400
+
+        operation_step = _get_operation_step_for_status(workflow)
+        cancel_message = f"Run cancelled by {user.name}"
+        if reason:
+            cancel_message = f"{cancel_message}: {reason[:180]}"
+
+        if operation_step and operation_step.status in ("pending", "in_progress", "awaiting_input"):
+            existing_output = operation_step.output_data if isinstance(operation_step.output_data, dict) else {}
+            failed_output = {
+                **existing_output,
+                "error": cancel_message,
+                "cancelled": True,
+            }
+            update_step_status(db, operation_step.id, "failed", output_data=failed_output)
+
+        update_workflow_status(db, workflow_id, "failed")
+        create_workflow_message(
+            db,
+            workflow_id=workflow_id,
+            sender_type="system",
+            channel="system",
+            message=f"{cancel_message}. You can retry from the workflow page."
+        )
+        create_event(
+            db, workflow_id=workflow_id, event_type="failed",
+            actor_id=user_id, actor_type="human", channel="web",
+            step_id=operation_step.id if operation_step else None,
+            message=cancel_message,
+            metadata_json={"cancelled": True}
+        )
+
+        return jsonify({
+            "message": "Active run cancelled.",
+            "workflow": get_workflow_by_id(db, workflow_id).to_dict()
+        }), 200
+    finally:
+        db.close()
+
+
+@workflow_bp.route('/api/workflows/<int:workflow_id>/retry-run', methods=['POST'])
+def retry_failed_run(workflow_id):
+    """
+    Retry a failed/stalled run.
+    If PPT generation failed, retries PPT.
+    Otherwise restarts agent research from description-first context.
+    """
+    db = SessionLocal()
+    try:
+        data = request.json or {}
+        user_id = data.get("user_id")
+        if not user_id:
+            return jsonify({"error": "user_id is required"}), 400
+
+        workflow = get_workflow_by_id(db, workflow_id)
+        if not workflow:
+            return jsonify({"error": "Workflow not found"}), 404
+
+        user = get_user_by_id(db, user_id)
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+        if user_id not in _participant_user_ids(workflow):
+            return jsonify({"error": "User is not a participant in this workflow"}), 403
+        workflow = _maybe_fail_stalled_workflow(db, workflow)
+        if user_id != workflow.user_id:
+            return jsonify({"error": "Only the requester can retry a failed run"}), 403
+        if workflow.status in RUNNING_WORKFLOW_STATUSES:
+            return jsonify({"error": "Run is still active. Cancel it before retrying."}), 400
+        if not _has_agent_participant(workflow):
+            return jsonify({"error": "No agent collaborator is assigned to this workflow"}), 400
+
+        latest_generation_step = _get_latest_step_by_type(workflow, "agent_generation")
+        if latest_generation_step and latest_generation_step.status == "failed":
+            research_step = _get_latest_research_step_with_output(workflow)
+            if not research_step:
+                return jsonify({"error": "No completed research output found for PPT retry"}), 400
+
+            presentation_focus = _get_primary_focus(workflow)
+            research_text = _build_generation_research_context(workflow, research_step)
+
+            create_workflow_message(
+                db,
+                workflow_id=workflow_id,
+                sender_type="system",
+                channel="system",
+                message=f"{user.name} retried PPT generation after a failed/stalled run."
+            )
+            create_event(
+                db, workflow_id=workflow_id, event_type="generation_requested",
+                actor_id=user_id, actor_type="human", channel="web",
+                message=f"{user.name} retried PPT generation"
+            )
+            start_ppt_generation(
+                workflow_id,
+                research_text,
+                presentation_focus or workflow.title,
+                filename_hint=workflow.title
+            )
+            return jsonify({
+                "message": "PPT generation retry started.",
+                "workflow": get_workflow_by_id(db, workflow_id).to_dict()
+            }), 202
+
+        base_description = _get_request_description(workflow)
+        chat_context = _build_chat_context(workflow)
+        research_context = "\n\n".join(
+            part for part in [
+                base_description,
+                f"Collaboration context:\n{chat_context}" if chat_context else "",
+            ] if part
+        )
+        research_focus = base_description or (workflow.title or "").strip()
+
+        session_id = workflow.openclaw_session_id or f"workflow-{generate_session_id()}"
+        if not workflow.openclaw_session_id:
+            update_workflow_status(db, workflow_id, workflow.status, openclaw_session_id=session_id)
+
+        next_step_order = max((s.step_order for s in workflow.steps), default=0) + 1
+        research_step = create_workflow_step(
+            db,
+            workflow_id=workflow_id,
+            step_order=next_step_order,
+            step_type="agent_research",
+            provider_type="agent",
+            input_data={
+                "topic": research_focus,
+                "description": research_context,
+                "retry": True
+            }
+        )
+        create_workflow_message(
+            db,
+            workflow_id=workflow_id,
+            sender_type="system",
+            channel="system",
+            message=f"{user.name} retried agent research after a failed/stalled run."
+        )
+        create_event(
+            db, workflow_id=workflow_id, event_type="research_started",
+            actor_id=user_id, actor_type="human", channel="web",
+            message=f"{user.name} retried agent research"
+        )
+        start_research(
+            workflow_id,
+            research_focus,
+            session_id,
+            request_description=research_context,
+            research_step_id=research_step.id
+        )
+
+        return jsonify({
+            "message": "Research retry started.",
             "workflow": get_workflow_by_id(db, workflow_id).to_dict()
         }), 202
     finally:
@@ -815,6 +1268,7 @@ def _process_slack_approval(workflow_id: int, slack_user_id: str,
     db = SessionLocal()
     try:
         workflow = get_workflow_by_id(db, workflow_id)
+        workflow = _maybe_fail_stalled_workflow(db, workflow)
         if not workflow or workflow.status != "awaiting_review":
             print(f"[Slack] Workflow {workflow_id} not in reviewable state")
             return
@@ -847,18 +1301,24 @@ def _process_slack_approval(workflow_id: int, slack_user_id: str,
         )
 
         # Get research text for PPT generation
-        research_text = ""
+        presentation_focus = _get_primary_focus(workflow)
+        research_text = presentation_focus
         for step in workflow.steps:
             if step.step_type == "agent_research" and step.output_data:
                 research_text = (
                     step.output_data.get("raw_research") or
                     step.output_data.get("summary") or
-                    ""
+                    presentation_focus
                 )
                 break
 
         # Start PPT generation
-        start_ppt_generation(workflow_id, research_text, workflow.title)
+        start_ppt_generation(
+            workflow_id,
+            research_text,
+            presentation_focus or workflow.title,
+            filename_hint=workflow.title
+        )
 
         print(f"[Slack] Approval processed for workflow {workflow_id}")
 
@@ -1059,7 +1519,8 @@ def accept_volunteer(request_id):
             step_type=step_type, provider_type=provider_type,
             assigned_to=user.id,
             input_data={
-                "topic": work_request.title,
+                "topic": (work_request.description or "").strip() or work_request.title,
+                "title": work_request.title,
                 "description": work_request.description,
                 "workflow_type": workflow_type,
                 "request_id": work_request.id,
@@ -1135,6 +1596,9 @@ def accept_volunteer(request_id):
 @workflow_bp.route('/api/workflows/<int:workflow_id>/completion', methods=['OPTIONS'])
 @workflow_bp.route('/api/workflows/<int:workflow_id>/start-research', methods=['OPTIONS'])
 @workflow_bp.route('/api/workflows/<int:workflow_id>/generate-ppt', methods=['OPTIONS'])
+@workflow_bp.route('/api/workflows/<int:workflow_id>/retry-ppt', methods=['OPTIONS'])
+@workflow_bp.route('/api/workflows/<int:workflow_id>/cancel-run', methods=['OPTIONS'])
+@workflow_bp.route('/api/workflows/<int:workflow_id>/retry-run', methods=['OPTIONS'])
 @workflow_bp.route('/api/slack/interactions', methods=['OPTIONS'])
 def handle_workflow_options(**kwargs):
     """Handle preflight CORS requests for workflow endpoints."""

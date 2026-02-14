@@ -35,13 +35,25 @@ interface MarketplaceProps {
     onSelectRequest: (requestId: number) => void;
 }
 
+const CAPABILITY_OPTIONS = [
+    'research',
+    'presentation',
+    'slides',
+    'ppt_generation',
+    'design',
+    'branding',
+    'compliance',
+    'regulatory',
+    'risk',
+] as const;
+
 const Marketplace: React.FC<MarketplaceProps> = ({ currentUser, onSelectRequest }) => {
     const [requests, setRequests] = useState<WorkRequest[]>([]);
     const [loading, setLoading] = useState(true);
     const [showPostForm, setShowPostForm] = useState(false);
     const [newTitle, setNewTitle] = useState('');
     const [newDesc, setNewDesc] = useState('');
-    const [newCaps, setNewCaps] = useState('research');
+    const [newCaps, setNewCaps] = useState<string[]>(['research']);
     const [posting, setPosting] = useState(false);
 
     const fetchRequests = useCallback(async () => {
@@ -69,11 +81,12 @@ const Marketplace: React.FC<MarketplaceProps> = ({ currentUser, onSelectRequest 
                 title: newTitle.trim(),
                 description: newDesc.trim(),
                 requester_id: currentUser.id,
-                required_capabilities: newCaps.split(',').map(c => c.trim()),
+                required_capabilities: newCaps,
             });
             toast.success('Work request posted to marketplace!');
             setNewTitle('');
             setNewDesc('');
+            setNewCaps(['research']);
             setShowPostForm(false);
             fetchRequests();
         } catch (err) {
@@ -92,6 +105,11 @@ const Marketplace: React.FC<MarketplaceProps> = ({ currentUser, onSelectRequest 
         });
     };
 
+    const handleCapabilitySelection = (event: React.ChangeEvent<HTMLSelectElement>) => {
+        const selected = Array.from(event.target.selectedOptions).map((option) => option.value);
+        setNewCaps(selected);
+    };
+
     if (loading) {
         return (
             <div className="flex items-center justify-center py-20">
@@ -104,7 +122,7 @@ const Marketplace: React.FC<MarketplaceProps> = ({ currentUser, onSelectRequest 
     }
 
     return (
-        <div className="max-w-5xl mx-auto px-6 py-8 animate-fade-in">
+        <div className="max-w-5xl mx-auto px-6 py-8">
             {/* Page Header */}
             <div className="flex items-center justify-between mb-8">
                 <div>
@@ -124,7 +142,7 @@ const Marketplace: React.FC<MarketplaceProps> = ({ currentUser, onSelectRequest 
 
             {/* Post Need Form */}
             {showPostForm && (
-                <div className="glass-card p-6 mb-8 animate-fade-in">
+                <div className="glass-card p-6 mb-8">
                     <h3 className="text-white font-semibold mb-3">Post a New Work Request</h3>
                     <div className="space-y-4">
                         <div>
@@ -148,22 +166,30 @@ const Marketplace: React.FC<MarketplaceProps> = ({ currentUser, onSelectRequest 
                             />
                         </div>
                         <div>
-                            <label className="block text-xs font-medium text-[var(--color-text-muted)] uppercase mb-1">Required Capabilities (comma separated)</label>
-                            <input
-                                type="text"
+                            <label className="block text-xs font-medium text-[var(--color-text-muted)] uppercase mb-1">Required Capabilities</label>
+                            <select
+                                multiple
                                 value={newCaps}
-                                onChange={(e) => setNewCaps(e.target.value)}
-                                placeholder="e.g. research, compliance, branding"
-                                className="w-full bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg px-4 py-2 text-white text-sm focus:outline-none focus:border-purple-500"
-                            />
+                                onChange={handleCapabilitySelection}
+                                className="w-full bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg px-4 py-2 text-white text-sm focus:outline-none focus:border-purple-500 min-h-[120px]"
+                            >
+                                {CAPABILITY_OPTIONS.map((capability) => (
+                                    <option key={capability} value={capability}>
+                                        {capability}
+                                    </option>
+                                ))}
+                            </select>
+                            <p className="text-[11px] text-[var(--color-text-muted)] mt-1">
+                                Hold Cmd/Ctrl to select multiple capabilities.
+                            </p>
                         </div>
                         <div className="flex justify-end gap-3 pt-2">
-                            <button onClick={() => setShowPostForm(false)} className="px-4 py-2 text-sm text-[var(--color-text-secondary)] hover:text-white transition-colors">
+                            <button onClick={() => setShowPostForm(false)} className="px-4 py-2 text-sm text-[var(--color-text-secondary)]">
                                 Cancel
                             </button>
                             <button
                                 onClick={handlePostRequest}
-                                disabled={!newTitle.trim() || posting}
+                                disabled={!newTitle.trim() || !newDesc.trim() || newCaps.length === 0 || posting}
                                 className="btn btn-primary"
                             >
                                 {posting ? 'Posting...' : 'Post to Board'}
@@ -184,7 +210,7 @@ const Marketplace: React.FC<MarketplaceProps> = ({ currentUser, onSelectRequest 
                         <div
                             key={r.id}
                             onClick={() => onSelectRequest(r.id)}
-                            className="glass-card p-6 flex flex-col md:flex-row gap-6 cursor-pointer hover:border-purple-500/50 transition-all group"
+                            className="glass-card p-6 flex flex-col md:flex-row gap-6 cursor-pointer"
                         >
                             <div className="flex-1 min-w-0">
                                 <div className="flex items-center gap-3 mb-2">
@@ -196,7 +222,7 @@ const Marketplace: React.FC<MarketplaceProps> = ({ currentUser, onSelectRequest 
                                         Posted by {r.requester.name}
                                     </span>
                                 </div>
-                                <h3 className="text-xl font-bold text-white mb-2 group-hover:text-purple-300 transition-colors">
+                                <h3 className="text-xl font-bold text-white mb-2">
                                     {r.title}
                                 </h3>
                                 <p className="text-[var(--color-text-secondary)] text-sm line-clamp-2 mb-4">
@@ -234,7 +260,7 @@ const Marketplace: React.FC<MarketplaceProps> = ({ currentUser, onSelectRequest 
                                 </div>
                                 <div className="text-right">
                                     <p className="text-[10px] text-[var(--color-text-muted)]">{formatDate(r.created_at)}</p>
-                                    <span className="text-purple-400 text-sm font-medium inline-flex items-center gap-1 mt-1 group-hover:translate-x-1 transition-transform">
+                                    <span className="text-purple-400 text-sm font-medium inline-flex items-center gap-1 mt-1">
                                         View & Volunteer <span>→</span>
                                     </span>
                                 </div>
