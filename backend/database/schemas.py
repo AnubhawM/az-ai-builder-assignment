@@ -19,6 +19,7 @@ class UserCreate(UserBase):
 class UserResponse(UserBase):
     id: int
     slack_user_id: Optional[str] = None
+    is_agent: bool
     is_active: bool
     created_at: Optional[datetime] = None
 
@@ -42,6 +43,7 @@ class WorkflowResponse(BaseModel):
     title: str
     status: str
     openclaw_session_id: Optional[str] = None
+    parent_id: Optional[int] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -52,6 +54,8 @@ class WorkflowDetailResponse(WorkflowResponse):
     owner: Optional[UserResponse] = None
     steps: List["WorkflowStepResponse"] = []
     events: List["WorkflowEventResponse"] = []
+    messages: List["WorkflowMessageResponse"] = []
+    approvals: List["WorkflowApprovalResponse"] = []
 
 
 # ──────────────────────────────────────
@@ -100,6 +104,52 @@ class WorkflowEventResponse(BaseModel):
 
 
 # ──────────────────────────────────────
+# Workflow Chat Schemas
+# ──────────────────────────────────────
+
+class WorkflowMessageCreate(BaseModel):
+    user_id: int
+    message: str
+    channel: str = "web"
+    ask_agent: Optional[bool] = None
+
+class WorkflowMessageResponse(BaseModel):
+    id: int
+    workflow_id: int
+    sender_id: Optional[int] = None
+    sender_type: str
+    channel: str
+    message: str
+    metadata_json: Optional[Dict[str, Any]] = None
+    created_at: Optional[datetime] = None
+    sender: Optional[UserResponse] = None
+
+    class Config:
+        from_attributes = True
+
+
+# ──────────────────────────────────────
+# Workflow Completion Schemas
+# ──────────────────────────────────────
+
+class WorkflowCompletionAction(BaseModel):
+    user_id: int
+    action: str  # mark_ready | reopen
+
+class WorkflowApprovalResponse(BaseModel):
+    id: int
+    workflow_id: int
+    user_id: int
+    status: str
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    user: Optional[UserResponse] = None
+
+    class Config:
+        from_attributes = True
+
+
+# ──────────────────────────────────────
 # Review Action Schemas
 # ──────────────────────────────────────
 
@@ -111,5 +161,48 @@ class ReviewAction(BaseModel):
     channel: str = "web"  # "web" or "slack"
 
 
+# ──────────────────────────────────────
+# Marketplace Store Schemas
+# ──────────────────────────────────────
+
+class WorkRequestBase(BaseModel):
+    title: str
+    description: str
+    required_capabilities: Optional[List[str]] = None
+
+class WorkRequestCreate(WorkRequestBase):
+    requester_id: int
+    parent_workflow_id: Optional[int] = None
+
+class VolunteerCreate(BaseModel):
+    request_id: int
+    user_id: int
+    note: Optional[str] = None
+
+class VolunteerResponse(BaseModel):
+    id: int
+    request_id: int
+    user_id: int
+    note: Optional[str] = None
+    status: str
+    created_at: datetime
+    user: Optional[UserResponse] = None
+
+    class Config:
+        from_attributes = True
+
+class WorkRequestResponse(WorkRequestBase):
+    id: int
+    requester_id: int
+    status: str
+    parent_workflow_id: Optional[int] = None
+    created_at: datetime
+    requester: Optional[UserResponse] = None
+    volunteers: List[VolunteerResponse] = []
+
+    class Config:
+        from_attributes = True
+
 # Resolve forward references
 WorkflowDetailResponse.model_rebuild()
+WorkRequestResponse.model_rebuild()

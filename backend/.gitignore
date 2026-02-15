@@ -12,7 +12,8 @@ temp_uploads
 
 # SQLite database
 *.db
+*.db-wal
+*.db-shm
 
 # macOS
 .DS_Store
-

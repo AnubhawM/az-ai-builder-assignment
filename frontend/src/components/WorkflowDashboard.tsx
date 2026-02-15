@@ -27,6 +27,7 @@ interface WorkflowDashboardProps {
 
 const statusConfig: Record<string, { label: string; badge: string; icon: string }> = {
     pending: { label: 'Pending', badge: 'badge-pending', icon: '⏳' },
+    collaborating: { label: 'Collaborating', badge: 'badge-active', icon: '💬' },
     researching: { label: 'Research In Progress', badge: 'badge-active', icon: '🔍' },
     refining: { label: 'Refining Research', badge: 'badge-active', icon: '🔄' },
     awaiting_review: { label: 'Awaiting Review', badge: 'badge-review', icon: '👁️' },
@@ -45,7 +46,7 @@ const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSe
     const fetchWorkflows = useCallback(async () => {
         try {
             const res = await axios.get(`${import.meta.env.VITE_API_URL}/api/workflows`, {
-                params: { all: 'true' }
+                params: { user_id: currentUser.id }
             });
             setWorkflows(res.data.workflows);
         } catch (err) {
@@ -53,7 +54,7 @@ const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSe
         } finally {
             setLoading(false);
         }
-    }, []);
+    }, [currentUser.id]);
 
     useEffect(() => {
         fetchWorkflows();
@@ -110,7 +111,7 @@ const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSe
     }
 
     return (
-        <div className="max-w-5xl mx-auto px-6 py-8 animate-fade-in">
+        <div className="max-w-5xl mx-auto px-6 py-8">
             {/* Page Header */}
             <div className="flex items-center justify-between mb-8">
                 <div>
@@ -132,7 +133,7 @@ const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSe
 
             {/* New Workflow Form */}
             {showNewForm && (
-                <div className="glass-card p-6 mb-6 animate-fade-in">
+                <div className="glass-card p-6 mb-6">
                     <h3 className="text-white font-semibold mb-3">Create New Research Workflow</h3>
                     <div className="flex gap-3">
                         <input
@@ -140,7 +141,7 @@ const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSe
                             value={newTopic}
                             onChange={(e) => setNewTopic(e.target.value)}
                             placeholder="Enter a research topic (e.g., Sustainable energy technologies for AZ manufacturing)"
-                            className="flex-1 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg px-4 py-3 text-white text-sm placeholder:text-[var(--color-text-muted)] focus:outline-none focus:border-purple-500 transition-colors"
+                            className="flex-1 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg px-4 py-3 text-white text-sm placeholder:text-[var(--color-text-muted)] focus:outline-none focus:border-purple-500"
                             onKeyDown={(e) => e.key === 'Enter' && handleCreateWorkflow()}
                             disabled={creating}
                             id="new-workflow-topic"
@@ -243,7 +244,7 @@ const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSe
                                 <button
                                     key={w.id}
                                     onClick={() => onSelectWorkflow(w.id)}
-                                    className="glass-card-static w-full p-4 text-left flex items-center gap-4 cursor-pointer opacity-80 hover:opacity-100 transition-opacity"
+                                    className="glass-card-static w-full p-4 text-left flex items-center gap-4 cursor-pointer"
                                 >
                                     <div className="text-xl flex-shrink-0">{status.icon}</div>
                                     <div className="flex-1 min-w-0">

@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from database.config import engine
 from database import Base, SessionLocal
-from database.models import User, Workflow, WorkflowStep, WorkflowEvent
+from database.models import User, Workflow, WorkflowStep, WorkflowEvent, WorkRequest, Volunteer
 
 
 def create_tables():
@@ -49,6 +49,13 @@ def seed_users():
                 "role": "design_reviewer",
                 "slack_user_id": None,
             },
+            {
+                "name": "OpenClaw AI",
+                "email": "agent@openclaw.ai",
+                "role": "agent",
+                "is_agent": True,
+                "slack_user_id": None,
+            },
         ]
 
         for user_data in demo_users:
@@ -56,9 +63,9 @@ def seed_users():
             db.add(user)
 
         db.commit()
-        print(f"✅ Seeded {len(demo_users)} demo personas:")
+        print(f"✅ Seeded {len(demo_users)} personas:")
         for u in demo_users:
-            print(f"   → {u['name']} ({u['role']})")
+            print(f"   → {u['name']} ({u['role']}) {'[AGENT]' if u.get('is_agent') else ''}")
 
     except Exception as e:
         db.rollback()
