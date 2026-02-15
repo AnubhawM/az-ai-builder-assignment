@@ -127,9 +127,11 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
     const [workflow, setWorkflow] = useState<Workflow | null>(null);
     const [loading, setLoading] = useState(true);
     const [feedback, setFeedback] = useState('');
+    const [pptVerbosity, setPptVerbosity] = useState<'concise' | 'standard' | 'text-heavy'>('standard');
     const [chatInput, setChatInput] = useState('');
     const [submitting, setSubmitting] = useState(false);
     const [sendingMessage, setSendingMessage] = useState(false);
+    const [pendingAgentReplyAfterMessageId, setPendingAgentReplyAfterMessageId] = useState<number | null>(null);
     const [updatingCompletion, setUpdatingCompletion] = useState(false);
     const [triggeringResearch, setTriggeringResearch] = useState(false);
     const [retryingGeneration, setRetryingGeneration] = useState(false);
@@ -160,6 +162,16 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
         return () => clearInterval(interval);
     }, [fetchWorkflow]);
 
+    useEffect(() => {
+        if (!workflow || pendingAgentReplyAfterMessageId === null) return;
+        const hasAgentReply = workflow.messages.some(
+            (msg) => msg.sender_type === 'agent' && msg.id > pendingAgentReplyAfterMessageId
+        );
+        if (hasAgentReply) {
+            setPendingAgentReplyAfterMessageId(null);
+        }
+    }, [workflow, pendingAgentReplyAfterMessageId]);
+
     const handleReview = async (action: 'approve' | 'refine') => {
         if (submitting) return;
         if (action === 'refine' && !feedback.trim()) return;
@@ -169,6 +181,7 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
             await axios.post(`${import.meta.env.VITE_API_URL}/api/workflows/${workflowId}/review`, {
                 action,
                 feedback: action === 'refine' ? feedback.trim() : undefined,
+                generation_options: action === 'approve' ? { verbosity: pptVerbosity } : undefined,
                 user_id: currentUser.id,
                 channel: 'web',
             });
@@ -188,11 +201,15 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
 
         setSendingMessage(true);
         try {
-            await axios.post(`${import.meta.env.VITE_API_URL}/api/workflows/${workflowId}/messages`, {
+            const res = await axios.post(`${import.meta.env.VITE_API_URL}/api/workflows/${workflowId}/messages`, {
                 user_id: currentUser.id,
                 message: chatInput.trim(),
                 channel: 'web'
             });
+            const postedMessageId = res.data?.chat_message?.id;
+            if (res.data?.agent_reply_started && typeof postedMessageId === 'number') {
+                setPendingAgentReplyAfterMessageId(postedMessageId);
+            }
             setChatInput('');
             fetchWorkflow();
         } catch (err: any) {
@@ -311,32 +328,56 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
         );
     }
 
-    const orderedSteps = [...workflow.steps].sort((a, b) => a.step_order - b.step_order);
-    const pipelineSteps = orderedSteps.length > 0
-        ? orderedSteps.slice(0, 4).map((step) => {
-            const fallbackLabel = step.step_type.replace(/_/g, ' ');
-            const labelInfo = stepTypeLabels[step.step_type] || { label: fallbackLabel, icon: '📌' };
-            return {
-                key: `step-${step.id}`,
-                ...labelInfo,
-                step,
-            };
-        })
-        : [
-            { key: 'pending', label: 'Pending', icon: '⏳', step: null }
-        ];
+    const orderedSteps = [...workflow.steps].sort(
+        (a, b) => (a.step_order - b.step_order) || (a.id - b.id)
+    );
+    const latestStepByType = (stepType: string): WorkflowStep | null => {
+        const matches = orderedSteps.filter((step) => step.step_type === stepType);
+        return matches.length > 0 ? matches[matches.length - 1] : null;
+    };
 
-    const researchStep = workflow.steps.find(s => s.step_type === 'agent_research');
+    const researchStep = latestStepByType('agent_research');
     const researchOutput = researchStep?.output_data;
-    const generationStep = workflow.steps
-        .filter(s => s.step_type === 'agent_generation')
-        .slice(-1)[0];
+    const generationStep = latestStepByType('agent_generation');
     const generationError = generationStep?.output_data?.error as string | undefined;
+    const generationStatusMessage = generationStep?.output_data?.status_message as string | undefined;
+    const generationAttempt = generationStep?.output_data?.attempt as number | undefined;
+    const generationMaxAttempts = generationStep?.output_data?.max_attempts as number | undefined;
     const isGenerationFailed = generationStep?.status === 'failed';
 
-    const isAwaitingReview = workflow.status === 'awaiting_review';
+    const pipelineStageTypes = ['agent_collaboration', 'agent_research', 'human_review', 'agent_generation'];
+    const getPipelineStageStatus = (stepType: string, step: WorkflowStep | null): string => {
+        if (stepType === 'agent_research' && ['researching', 'refining'].includes(workflow.status)) {
+            return 'in_progress';
+        }
+        if (stepType === 'human_review' && workflow.status === 'awaiting_review') {
+            return 'awaiting_input';
+        }
+        if (stepType === 'agent_generation' && workflow.status === 'generating_ppt') {
+            return 'in_progress';
+        }
+        if (stepType === 'agent_generation' && ['researching', 'refining', 'awaiting_review'].includes(workflow.status)) {
+            return 'pending';
+        }
+        return step?.status || 'pending';
+    };
+    const pipelineSteps = pipelineStageTypes.map((stepType) => {
+        const step = latestStepByType(stepType);
+        const fallbackLabel = stepType.replace(/_/g, ' ');
+        const labelInfo = stepTypeLabels[stepType] || { label: fallbackLabel, icon: '📌' };
+        return {
+            key: `stage-${stepType}`,
+            ...labelInfo,
+            step,
+            status: getPipelineStageStatus(stepType, step),
+        };
+    });
+
     const isProcessing = ['researching', 'refining', 'generating_ppt', 'pending'].includes(workflow.status);
     const isActiveRun = ['researching', 'refining', 'generating_ppt'].includes(workflow.status);
+    const canApprove = workflow.status === 'awaiting_review';
+    const canRequestRefinement = ['awaiting_review', 'completed'].includes(workflow.status);
+    const isRefinementInputDisabled = submitting || isActiveRun || !canRequestRefinement;
     const hasAgentParticipant = workflow.steps.some(
         s => s.assignee?.is_agent || s.provider_type === 'agent'
     );
@@ -357,6 +398,18 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
         && hasAgentParticipant
         && currentUser.id === workflow.user_id
         && !isGenerationFailed;
+    const hasAnyAgentMessage = workflow.messages.some((msg) => msg.sender_type === 'agent');
+    const isWaitingForInitialKickoffReply = workflow.status === 'collaborating'
+        && hasAgentParticipant
+        && requiresResearch
+        && !hasAnyAgentMessage
+        && workflow.messages.some(
+            (msg) => msg.sender_type === 'system' && msg.message.includes('Research has not started yet.')
+        );
+    const isAgentResponding = pendingAgentReplyAfterMessageId !== null || isWaitingForInitialKickoffReply;
+    const agentRespondingCopy = isWaitingForInitialKickoffReply
+        ? 'OpenClaw is reviewing the request and drafting the kickoff confirmation...'
+        : 'OpenClaw is working on a response...';
 
     const humanApprovals = workflow.approvals.filter(a => !a.user?.is_agent);
     const currentApproval = humanApprovals.find(a => a.user_id === currentUser.id);
@@ -384,11 +437,10 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
             <div className="glass-card-static p-6 mb-6">
                 <div className="flex items-start justify-between">
                     {pipelineSteps.map((ps, idx) => {
-                        const step = ps.step;
-                        const status = step ? step.status : 'pending';
+                        const status = ps.status;
                         const dotClass = stepStatusToClass[status] || 'pipeline-dot-pending';
                         const isLast = idx === pipelineSteps.length - 1;
-                        const prevCompleted = idx > 0 && pipelineSteps[idx - 1].step?.status === 'completed';
+                        const prevCompleted = idx > 0 && pipelineSteps[idx - 1].status === 'completed';
 
                         return (
                             <div key={ps.key} className="pipeline-step">
@@ -530,8 +582,13 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                             <div className="w-12 h-12 border-2 border-purple-500 border-t-transparent rounded-full animate-spin-slow mx-auto mb-4" />
                             <h3 className="text-white font-semibold mb-2">Generating PowerPoint...</h3>
                             <p className="text-[var(--color-text-secondary)] text-sm">
-                                SlideSpeak is creating your presentation. This may take a few minutes.
+                                {generationStatusMessage || 'SlideSpeak is creating your presentation. This may take a few minutes.'}
                             </p>
+                            {generationAttempt && generationMaxAttempts && (
+                                <p className="text-xs text-[var(--color-text-muted)] mt-2">
+                                    Attempt {generationAttempt} of {generationMaxAttempts}
+                                </p>
+                            )}
                         </div>
                     )}
 
@@ -591,17 +648,35 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                         </div>
                     )}
 
-                    {isAwaitingReview && (
-                        <div className="glass-card p-6 border-purple-500/30" id="review-panel">
+                    <div
+                        className={`glass-card p-6 border-purple-500/30 ${isRefinementInputDisabled ? 'opacity-60' : ''}`}
+                        id="review-panel"
+                    >
                             <h3 className="text-white font-semibold mb-4 flex items-center gap-2">
                                 ⚡ Quality Gate — Your Review
                             </h3>
 
                             <div className="flex gap-3 mb-4">
+                                <div className="flex-1">
+                                    <label className="text-xs text-[var(--color-text-secondary)] font-medium mb-2 block">
+                                        PPT verbosity
+                                    </label>
+                                    <select
+                                        value={pptVerbosity}
+                                        onChange={(e) => setPptVerbosity(e.target.value as 'concise' | 'standard' | 'text-heavy')}
+                                        className="w-full bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-purple-500"
+                                        disabled={submitting || !canApprove}
+                                        id="ppt-verbosity-select"
+                                    >
+                                        <option value="concise">Concise</option>
+                                        <option value="standard">Standard</option>
+                                        <option value="text-heavy">Text-heavy</option>
+                                    </select>
+                                </div>
                                 <button
                                     onClick={() => handleReview('approve')}
-                                    disabled={submitting}
-                                    className="btn btn-success flex-1"
+                                    disabled={submitting || !canApprove}
+                                    className="btn btn-success flex-1 self-end"
                                     id="approve-btn"
                                 >
                                     {submitting ? 'Processing...' : '✅ Approve & Generate PPT'}
@@ -618,27 +693,36 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                                     placeholder="e.g., Please add more data about cost analysis and include recent statistics..."
                                     className="w-full bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg px-4 py-3 text-white text-sm placeholder:text-[var(--color-text-muted)] focus:outline-none focus:border-purple-500 resize-none"
                                     rows={3}
-                                    disabled={submitting}
+                                    disabled={isRefinementInputDisabled}
                                     id="feedback-input"
                                 />
                                 <button
                                     onClick={() => handleReview('refine')}
-                                    disabled={!feedback.trim() || submitting}
+                                    disabled={!feedback.trim() || isRefinementInputDisabled}
                                     className="btn btn-outline mt-2 w-full"
                                     id="refine-btn"
                                 >
-                                    {submitting ? 'Processing...' : '🔄 Request Refinement'}
+                                    {submitting ? 'Processing...' : isActiveRun ? '🔄 Refinement In Progress...' : '🔄 Request Refinement'}
                                 </button>
+                                {isActiveRun && (
+                                    <p className="text-xs text-[var(--color-text-muted)] mt-2">
+                                        Refinement controls unlock after the current run completes.
+                                    </p>
+                                )}
+                                {!isActiveRun && !canRequestRefinement && (
+                                    <p className="text-xs text-[var(--color-text-muted)] mt-2">
+                                        Refinement is available after research review and after PPT completion.
+                                    </p>
+                                )}
                             </div>
-                        </div>
-                    )}
+                    </div>
 
                     <div className="glass-card p-6" id="chat-panel">
                         <div className="flex items-center justify-between mb-4">
                             <h3 className="text-white font-semibold">💬 Collaboration Chat</h3>
                             {hasAgentParticipant && (
                                 <span className="text-[10px] text-emerald-400 uppercase tracking-wider">
-                                    OpenClaw enabled
+                                    {isAgentResponding ? 'OpenClaw responding...' : 'OpenClaw enabled'}
                                 </span>
                             )}
                         </div>
@@ -673,6 +757,20 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                                         </div>
                                     );
                                 })
+                            )}
+                            {isAgentResponding && (
+                                <div className="rounded-lg p-3 border bg-emerald-500/10 border-emerald-500/30 mr-8">
+                                    <div className="flex items-center justify-between mb-1">
+                                        <span className="text-xs font-semibold text-white">OpenClaw AI</span>
+                                        <span className="text-[10px] text-emerald-300 uppercase tracking-wider">
+                                            Responding
+                                        </span>
+                                    </div>
+                                    <div className="flex items-center gap-2 text-sm text-emerald-200">
+                                        <div className="w-3 h-3 border-2 border-emerald-400 border-t-transparent rounded-full animate-spin-slow" />
+                                        {agentRespondingCopy}
+                                    </div>
+                                </div>
                             )}
                         </div>
 

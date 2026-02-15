@@ -1,6 +1,7 @@
 // src/components/WorkflowDashboard.tsx
 import React, { useEffect, useState, useCallback } from 'react';
 import axios from 'axios';
+import { toast } from 'react-toastify';
 
 interface User {
     id: number;
@@ -11,6 +12,7 @@ interface User {
 
 interface WorkflowSummary {
     id: number;
+    user_id: number;
     title: string;
     status: string;
     workflow_type: string;
@@ -36,12 +38,15 @@ const statusConfig: Record<string, { label: string; badge: string; icon: string 
     failed: { label: 'Failed', badge: 'badge-error', icon: '❌' },
 };
 
+const runningWorkflowStatuses = new Set(['researching', 'refining', 'generating_ppt']);
+
 const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSelectWorkflow }) => {
     const [workflows, setWorkflows] = useState<WorkflowSummary[]>([]);
     const [loading, setLoading] = useState(true);
     const [showNewForm, setShowNewForm] = useState(false);
     const [newTopic, setNewTopic] = useState('');
     const [creating, setCreating] = useState(false);
+    const [deletingWorkflowId, setDeletingWorkflowId] = useState<number | null>(null);
 
     const fetchWorkflows = useCallback(async () => {
         try {
@@ -80,6 +85,41 @@ const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSe
             console.error('Failed to create workflow:', err);
         } finally {
             setCreating(false);
+        }
+    };
+
+    const handleCardKeyDown = (event: React.KeyboardEvent<HTMLDivElement>, workflowId: number) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        onSelectWorkflow(workflowId);
+    };
+
+    const handleDeleteWorkflow = async (workflow: WorkflowSummary) => {
+        if (deletingWorkflowId !== null) return;
+        if (runningWorkflowStatuses.has(workflow.status)) {
+            toast.error('Cancel the active run before deleting this workflow.');
+            return;
+        }
+        const confirmed = window.confirm(
+            `Delete "${workflow.title}"? This action cannot be undone.`
+        );
+        if (!confirmed) return;
+
+        setDeletingWorkflowId(workflow.id);
+        try {
+            await axios.delete(`${import.meta.env.VITE_API_URL}/api/workflows/${workflow.id}`, {
+                data: { user_id: currentUser.id }
+            });
+            setWorkflows((prev) => prev.filter((item) => item.id !== workflow.id));
+            toast.success('Workflow deleted.');
+        } catch (err) {
+            const errorMsg = axios.isAxiosError(err)
+                ? err.response?.data?.error || 'Failed to delete workflow.'
+                : 'Failed to delete workflow.';
+            toast.error(errorMsg);
+            console.error('Failed to delete workflow:', err);
+        } finally {
+            setDeletingWorkflowId(null);
         }
     };
 
@@ -186,9 +226,12 @@ const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSe
                         {activeWorkflows.map((w) => {
                             const status = statusConfig[w.status] || statusConfig.pending;
                             return (
-                                <button
+                                <div
                                     key={w.id}
                                     onClick={() => onSelectWorkflow(w.id)}
+                                    onKeyDown={(e) => handleCardKeyDown(e, w.id)}
+                                    role="button"
+                                    tabIndex={0}
                                     className="glass-card w-full p-5 text-left flex items-center gap-4 cursor-pointer"
                                     id={`workflow-card-${w.id}`}
                                 >
@@ -208,19 +251,35 @@ const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSe
                                         </div>
                                     </div>
 
-                                    {/* Meta */}
-                                    <div className="text-right flex-shrink-0 hidden sm:block">
-                                        <p className="text-xs text-[var(--color-text-muted)]">
-                                            {w.owner?.name || 'Unknown'}
-                                        </p>
-                                        <p className="text-xs text-[var(--color-text-muted)] mt-0.5">
-                                            {formatDate(w.updated_at || w.created_at)}
-                                        </p>
+                                    {/* Meta + Actions */}
+                                    <div className="flex items-center gap-3 flex-shrink-0">
+                                        <div className="text-right hidden sm:block">
+                                            <p className="text-xs text-[var(--color-text-muted)]">
+                                                {w.owner?.name || 'Unknown'}
+                                            </p>
+                                            <p className="text-xs text-[var(--color-text-muted)] mt-0.5">
+                                                {formatDate(w.updated_at || w.created_at)}
+                                            </p>
+                                        </div>
+                                        {w.user_id === currentUser.id && (
+                                            <button
+                                                onClick={(e) => {
+                                                    e.stopPropagation();
+                                                    void handleDeleteWorkflow(w);
+                                                }}
+                                                onKeyDown={(e) => e.stopPropagation()}
+                                                disabled={deletingWorkflowId === w.id}
+                                                className="btn btn-ghost text-xs px-3 py-1.5 text-red-300"
+                                                id={`delete-workflow-btn-${w.id}`}
+                                            >
+                                                {deletingWorkflowId === w.id ? 'Deleting...' : 'Delete'}
+                                            </button>
+                                        )}
                                     </div>
 
                                     {/* Arrow */}
                                     <span className="text-[var(--color-text-muted)] text-lg flex-shrink-0">›</span>
-                                </button>
+                                </div>
                             );
                         })}
                     </div>
@@ -241,9 +300,12 @@ const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSe
                         {completedWorkflows.map((w) => {
                             const status = statusConfig[w.status] || statusConfig.pending;
                             return (
-                                <button
+                                <div
                                     key={w.id}
                                     onClick={() => onSelectWorkflow(w.id)}
+                                    onKeyDown={(e) => handleCardKeyDown(e, w.id)}
+                                    role="button"
+                                    tabIndex={0}
                                     className="glass-card-static w-full p-4 text-left flex items-center gap-4 cursor-pointer"
                                 >
                                     <div className="text-xl flex-shrink-0">{status.icon}</div>
@@ -254,7 +316,21 @@ const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSe
                                     <p className="text-xs text-[var(--color-text-muted)] flex-shrink-0 hidden sm:block">
                                         {formatDate(w.created_at)}
                                     </p>
-                                </button>
+                                    {w.user_id === currentUser.id && (
+                                        <button
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                void handleDeleteWorkflow(w);
+                                            }}
+                                            onKeyDown={(e) => e.stopPropagation()}
+                                            disabled={deletingWorkflowId === w.id}
+                                            className="btn btn-ghost text-xs px-3 py-1.5 text-red-300"
+                                            id={`delete-workflow-btn-${w.id}`}
+                                        >
+                                            {deletingWorkflowId === w.id ? 'Deleting...' : 'Delete'}
+                                        </button>
+                                    )}
+                                </div>
                             );
                         })}
                     </div>

@@ -6,6 +6,7 @@ Endpoints:
     POST /api/workflows              — Create a new workflow (triggers research)
     GET  /api/workflows              — List workflows (filtered by user/role)
     GET  /api/workflows/<id>         — Get full workflow detail
+    DELETE /api/workflows/<id>       — Delete a workflow owned by the requester
     POST /api/workflows/<id>/review  — Submit approve/refine action
     GET  /api/workflows/<id>/messages — List workflow chat messages
     POST /api/workflows/<id>/messages — Post workflow chat message
@@ -31,6 +32,7 @@ from crud import (
     create_workflow, get_workflow_by_id,
     get_all_workflows, get_workflows_by_user,
     get_workflows_assigned_to_user,
+    delete_workflow,
     update_workflow_status,
     create_workflow_step, get_active_step,
     update_step_status,
@@ -443,6 +445,48 @@ def get_workflow_detail(workflow_id):
         db.close()
 
 
+@workflow_bp.route('/api/workflows/<int:workflow_id>', methods=['DELETE'])
+def delete_workflow_route(workflow_id):
+    """Delete a workflow from dashboard listings."""
+    db = SessionLocal()
+    try:
+        payload = request.get_json(silent=True) or {}
+        user_id_raw = payload.get("user_id")
+        if user_id_raw is None:
+            user_id_raw = request.args.get("user_id", type=int)
+        if user_id_raw is None:
+            return jsonify({"error": "user_id is required"}), 400
+        try:
+            user_id = int(user_id_raw)
+        except (TypeError, ValueError):
+            return jsonify({"error": "user_id must be a number"}), 400
+
+        workflow = get_workflow_by_id(db, workflow_id)
+        if not workflow:
+            return jsonify({"error": "Workflow not found"}), 404
+
+        workflow = _maybe_fail_stalled_workflow(db, workflow)
+
+        if user_id != workflow.user_id:
+            return jsonify({"error": "Only the workflow owner can delete this workflow"}), 403
+
+        if workflow.status in RUNNING_WORKFLOW_STATUSES:
+            return jsonify({
+                "error": (
+                    "Workflow is currently running. Cancel the active run before deleting."
+                )
+            }), 400
+
+        delete_workflow(db, workflow)
+        return jsonify({"message": "Workflow deleted"}), 200
+    except Exception as e:
+        db.rollback()
+        print(f"Error deleting workflow {workflow_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+    finally:
+        db.close()
+
+
 # ──────────────────────────────────────
 # Review / Approve / Refine
 # ──────────────────────────────────────
@@ -456,6 +500,7 @@ def submit_review(workflow_id):
     {
         "action": "approve" | "refine",
         "feedback": "Please add more data about cost analysis...",  (required for refine)
+        "generation_options": {"verbosity": "concise|standard|text-heavy"},  (optional; approve only)
         "user_id": 1,
         "channel": "web"  (optional, defaults to "web")
     }
@@ -468,6 +513,7 @@ def submit_review(workflow_id):
 
         action = data.get("action")
         feedback = data.get("feedback", "")
+        generation_options = data.get("generation_options") or {}
         user_id = data.get("user_id")
         channel = data.get("channel", "web")
 
@@ -477,6 +523,8 @@ def submit_review(workflow_id):
             return jsonify({"error": "user_id is required"}), 400
         if action == "refine" and not feedback.strip():
             return jsonify({"error": "Feedback is required for refinement"}), 400
+        if generation_options and not isinstance(generation_options, dict):
+            return jsonify({"error": "generation_options must be an object"}), 400
 
         # Get the workflow
         workflow = get_workflow_by_id(db, workflow_id)
@@ -491,9 +539,16 @@ def submit_review(workflow_id):
             return jsonify({"error": "User is not a participant in this workflow"}), 403
         workflow = _maybe_fail_stalled_workflow(db, workflow)
 
-        if workflow.status not in ("awaiting_review",):
+        if action == "approve" and workflow.status != "awaiting_review":
             return jsonify({
-                "error": f"Workflow is not awaiting review (current status: {workflow.status})"
+                "error": f"Approve is only allowed in awaiting_review (current status: {workflow.status})"
+            }), 400
+        if action == "refine" and workflow.status not in ("awaiting_review", "completed"):
+            return jsonify({
+                "error": (
+                    "Refinement is only allowed in awaiting_review or completed "
+                    f"(current status: {workflow.status})"
+                )
             }), 400
 
         # Find latest research output and current review step.
@@ -506,6 +561,13 @@ def submit_review(workflow_id):
             return jsonify({"error": "Only the assigned reviewer can submit this review"}), 403
 
         if action == "approve":
+            verbosity_override = str(generation_options.get("verbosity") or "").strip().lower()
+            allowed_verbosity = {"concise", "standard", "text-heavy"}
+            if verbosity_override and verbosity_override not in allowed_verbosity:
+                return jsonify({
+                    "error": "generation_options.verbosity must be one of concise, standard, text-heavy"
+                }), 400
+
             # ── APPROVE: Mark review as done, start PPT generation ──
 
             # Update the review step
@@ -528,7 +590,8 @@ def submit_review(workflow_id):
                 workflow_id,
                 research_text,
                 presentation_focus,
-                filename_hint=workflow.title
+                filename_hint=workflow.title,
+                generation_overrides={"verbosity": verbosity_override} if verbosity_override else None
             )
 
             return jsonify({
@@ -538,6 +601,25 @@ def submit_review(workflow_id):
 
         elif action == "refine":
             # ── REFINE: Log feedback, restart research with context ──
+            was_completed = workflow.status == "completed"
+
+            # If refining after completion, reopen the previous generation stage and linked request.
+            if was_completed:
+                latest_generation_step = _get_latest_step_by_type(workflow, "agent_generation")
+                if latest_generation_step and latest_generation_step.status == "completed":
+                    update_step_status(db, latest_generation_step.id, "pending")
+
+                linked_request_id = None
+                for step in workflow.steps:
+                    payload = step.input_data or {}
+                    if isinstance(payload, dict) and payload.get("request_id"):
+                        linked_request_id = payload.get("request_id")
+                        break
+                if linked_request_id:
+                    linked_request = get_work_request_by_id(db, linked_request_id)
+                    if linked_request and linked_request.status == "completed":
+                        linked_request.status = "assigned"
+
             if review_step:
                 update_step_status(db, review_step.id, "completed", feedback=feedback)
 
@@ -547,6 +629,14 @@ def submit_review(workflow_id):
                 actor_id=user_id, actor_type="human", channel=channel,
                 message=f"Refinement requested by {user.name}: {feedback[:200]}"
             )
+            if was_completed:
+                create_event(
+                    db, workflow_id=workflow_id, event_type="reopened",
+                    actor_id=user_id, actor_type="human", channel=channel,
+                    message=f"{user.name} reopened the workflow for further refinement"
+                )
+
+            update_workflow_status(db, workflow_id, "refining")
 
             # Start refinement in background thread (uses same session)
             start_refinement(
@@ -1617,6 +1707,6 @@ def handle_workflow_options(**kwargs):
     origin = request.headers.get('Origin')
     if origin in ["http://localhost:5173", "http://localhost:5174"]:
         response.headers['Access-Control-Allow-Origin'] = origin
-    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS'
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
     return response
