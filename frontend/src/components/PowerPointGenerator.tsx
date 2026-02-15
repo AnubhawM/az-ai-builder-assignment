@@ -183,25 +183,17 @@ const PowerPointGenerator: React.FC = () => {
                 setTimeout(() => setLoadingStatus(status), delay)
             );
 
-            const response = await axios.post<GenerationResult & { start_timestamp: number }>(
-                `${import.meta.env.VITE_API_URL}/generate-ppt`,
-                { topic },
-                {
-                    headers: { 'Content-Type': 'application/json' },
-                    timeout: 30000 // 30 second timeout for initial request
-                }
-            );
-
-            // Show initial pending result
+            stopPolling();
+            setLoading(false);
+            setLoadingStatus('');
+            const msg = 'This screen is deprecated. Start from Marketplace/Workflow and use the workflow Generate PPT action.';
+            toast.info(msg);
             setResult({
-                ...response.data,
-                status: 'pending'
+                message: msg,
+                output_directory: OUTPUT_DIRECTORY,
+                status: 'error'
             });
-
-            // Start polling for completion
-            const startTimestamp = response.data.start_timestamp || (Date.now() / 1000);
-            toast.info('🚀 Generation started! Watching for your PowerPoint...');
-            startPolling(startTimestamp);
+            return;
 
         } catch (error: any) {
             console.error(error);
@@ -239,7 +231,7 @@ const PowerPointGenerator: React.FC = () => {
             <div className="space-y-4">
                 <div className="relative">
                     <textarea
-                        className="w-full p-4 bg-white border-2 border-purple-100 rounded-xl focus:ring-2 focus:ring-purple-500 focus:border-purple-300 outline-none transition-all text-gray-900 placeholder:text-gray-400 resize-none shadow-inner"
+                        className="w-full p-4 bg-white border-2 border-purple-100 rounded-xl focus:ring-2 focus:ring-purple-500 focus:border-purple-300 outline-none text-gray-900 placeholder:text-gray-400 resize-none shadow-inner"
                         rows={4}
                         placeholder="e.g., The future of sustainable energy technologies and their economic impact..."
                         value={topic}
@@ -271,7 +263,7 @@ const PowerPointGenerator: React.FC = () => {
                                     toast.error('Failed to open folder');
                                 }
                             }}
-                            className="ml-3 px-3 py-1.5 bg-purple-600 text-white text-xs font-medium rounded-lg hover:bg-purple-700 transition-colors flex items-center shadow-sm"
+                            className="ml-3 px-3 py-1.5 bg-purple-600 text-white text-xs font-medium rounded-lg flex items-center shadow-sm"
                         >
                             <span className="mr-1">📂</span>
                             Open in Finder
@@ -280,9 +272,9 @@ const PowerPointGenerator: React.FC = () => {
                 </div>
 
                 <button
-                    className={`w-full px-6 py-4 rounded-xl text-white font-semibold text-lg shadow-lg transition-all transform ${loading
+                    className={`w-full px-6 py-4 rounded-xl text-white font-semibold text-lg shadow-lg ${loading
                         ? 'bg-gray-400 cursor-not-allowed'
-                        : 'bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-700 hover:to-indigo-700 hover:shadow-xl hover:-translate-y-0.5 active:scale-[0.98]'
+                        : 'bg-gradient-to-r from-purple-600 to-indigo-600'
                         }`}
                     onClick={generatePowerPoint}
                     disabled={loading}
@@ -310,7 +302,7 @@ const PowerPointGenerator: React.FC = () => {
             </div>
 
             {result && (
-                <div className={`mt-8 p-6 rounded-xl border-2 transition-all transform animate-fadeIn ${result.status === 'completed'
+                <div className={`mt-8 p-6 rounded-xl border-2 ${result.status === 'completed'
                     ? 'bg-green-50 border-green-200'
                     : result.status === 'pending'
                         ? 'bg-yellow-50 border-yellow-200'
@@ -388,7 +380,7 @@ const PowerPointGenerator: React.FC = () => {
                     <button
                         onClick={fetchExistingFiles}
                         disabled={loadingFiles}
-                        className="text-purple-600 hover:text-purple-800 text-sm font-medium flex items-center transition-colors"
+                        className="text-purple-600 text-sm font-medium flex items-center"
                     >
                         {loadingFiles ? (
                             <svg className="animate-spin h-4 w-4 mr-1" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
@@ -426,7 +418,7 @@ const PowerPointGenerator: React.FC = () => {
                             return (
                                 <div
                                     key={file.name}
-                                    className={`bg-white rounded-lg p-4 border shadow-sm transition-all hover:shadow-md ${isNew ? 'border-green-300 bg-green-50' : 'border-gray-200'
+                                    className={`bg-white rounded-lg p-4 border shadow-sm ${isNew ? 'border-green-300 bg-green-50' : 'border-gray-200'
                                         }`}
                                 >
                                     <div className="flex items-center">
@@ -451,16 +443,6 @@ const PowerPointGenerator: React.FC = () => {
                     </div>
                 )}
             </div>
-
-            <style>{`
-                @keyframes fadeIn {
-                    from { opacity: 0; transform: translateY(10px); }
-                    to { opacity: 1; transform: translateY(0); }
-                }
-                .animate-fadeIn {
-                    animation: fadeIn 0.3s ease-out forwards;
-                }
-            `}</style>
         </Card>
     );
 };
