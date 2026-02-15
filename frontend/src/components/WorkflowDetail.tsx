@@ -331,6 +331,25 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
     const orderedSteps = [...workflow.steps].sort(
         (a, b) => (a.step_order - b.step_order) || (a.id - b.id)
     );
+    const originalRequestDescription = (() => {
+        // Prefer the earliest marketplace-linked step description when available.
+        for (const step of orderedSteps) {
+            const payload = step.input_data;
+            if (!payload || typeof payload !== 'object') continue;
+            const desc = typeof payload.description === 'string' ? payload.description.trim() : '';
+            if (!desc) continue;
+            const hasRequestId = payload.request_id !== undefined && payload.request_id !== null;
+            if (hasRequestId) return desc;
+        }
+        // Fallback for non-marketplace workflows that still carry a description.
+        for (const step of orderedSteps) {
+            const payload = step.input_data;
+            if (!payload || typeof payload !== 'object') continue;
+            const desc = typeof payload.description === 'string' ? payload.description.trim() : '';
+            if (desc) return desc;
+        }
+        return '';
+    })();
     const latestStepByType = (stepType: string): WorkflowStep | null => {
         const matches = orderedSteps.filter((step) => step.step_type === stepType);
         return matches.length > 0 ? matches[matches.length - 1] : null;
@@ -433,6 +452,15 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                     </p>
                 </div>
             </div>
+
+            {originalRequestDescription && (
+                <div className="glass-card p-6 mb-6">
+                    <h3 className="text-white font-semibold mb-2">Request Description</h3>
+                    <p className="text-sm text-[var(--color-text-secondary)] whitespace-pre-wrap leading-relaxed">
+                        {originalRequestDescription}
+                    </p>
+                </div>
+            )}
 
             <div className="glass-card-static p-6 mb-6">
                 <div className="flex items-start justify-between">

@@ -104,7 +104,13 @@ const MarketplaceDetail: React.FC<MarketplaceDetailProps> = ({ requestId, curren
     if (!request) return null;
 
     const isRequester = currentUser.id === request.requester_id;
-    const hasVolunteered = request.volunteers.some(v => v.user_id === currentUser.id);
+    const isDirectInvite = (note: string) => (note || '').startsWith('Direct invite');
+    const myInvite = request.volunteers.find(
+        (v) => v.user_id === currentUser.id && v.status === 'pending' && isDirectInvite(v.note)
+    );
+    const hasVolunteered = request.volunteers.some(
+        (v) => v.user_id === currentUser.id && !isDirectInvite(v.note)
+    );
 
     return (
         <div className="max-w-4xl mx-auto px-6 py-8">
@@ -206,7 +212,23 @@ const MarketplaceDetail: React.FC<MarketplaceDetailProps> = ({ requestId, curren
 
                 {/* Sidebar Actions */}
                 <div className="space-y-6">
-                    {!isRequester && request.status === 'open' && !hasVolunteered && (
+                    {!isRequester && request.status === 'open' && !!myInvite && (
+                        <div className="glass-card p-6 border-emerald-500/30">
+                            <h4 className="text-white font-bold mb-3 uppercase text-xs tracking-widest">Direct Invite</h4>
+                            <p className="text-sm text-[var(--color-text-secondary)] mb-4">
+                                You were invited by the requester to collaborate on this need.
+                            </p>
+                            <button
+                                onClick={() => handleAccept(myInvite.id)}
+                                disabled={accepting !== null}
+                                className="btn btn-primary w-full"
+                            >
+                                {accepting === myInvite.id ? 'Starting...' : 'Accept & Start'}
+                            </button>
+                        </div>
+                    )}
+
+                    {!isRequester && request.status === 'open' && !hasVolunteered && !myInvite && (
                         <div className="glass-card p-6 border-purple-500/30">
                             <h4 className="text-white font-bold mb-3 uppercase text-xs tracking-widest">Your Proposal</h4>
                             <textarea

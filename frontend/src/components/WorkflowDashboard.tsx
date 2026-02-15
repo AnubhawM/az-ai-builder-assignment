@@ -22,9 +22,24 @@ interface WorkflowSummary {
     steps: Array<{ step_type: string; status: string; iteration_count: number }>;
 }
 
+interface InviteRequest {
+    id: number;
+    title: string;
+    description: string;
+    required_capabilities: string[];
+    created_at: string;
+    requester: { name: string; role: string } | null;
+}
+
+interface MarketplaceInvite {
+    volunteer_id: number;
+    request: InviteRequest;
+}
+
 interface WorkflowDashboardProps {
     currentUser: User;
     onSelectWorkflow: (workflowId: number) => void;
+    onSelectRequest: (requestId: number) => void;
 }
 
 const statusConfig: Record<string, { label: string; badge: string; icon: string }> = {
@@ -40,13 +55,15 @@ const statusConfig: Record<string, { label: string; badge: string; icon: string 
 
 const runningWorkflowStatuses = new Set(['researching', 'refining', 'generating_ppt']);
 
-const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSelectWorkflow }) => {
+const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSelectWorkflow, onSelectRequest }) => {
     const [workflows, setWorkflows] = useState<WorkflowSummary[]>([]);
+    const [invites, setInvites] = useState<MarketplaceInvite[]>([]);
     const [loading, setLoading] = useState(true);
     const [showNewForm, setShowNewForm] = useState(false);
     const [newTopic, setNewTopic] = useState('');
     const [creating, setCreating] = useState(false);
     const [deletingWorkflowId, setDeletingWorkflowId] = useState<number | null>(null);
+    const [acceptingInviteId, setAcceptingInviteId] = useState<number | null>(null);
 
     const fetchWorkflows = useCallback(async () => {
         try {
@@ -61,12 +78,27 @@ const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSe
         }
     }, [currentUser.id]);
 
+    const fetchInvites = useCallback(async () => {
+        try {
+            const res = await axios.get(`${import.meta.env.VITE_API_URL}/api/marketplace/invites`, {
+                params: { user_id: currentUser.id }
+            });
+            setInvites(res.data.invites || []);
+        } catch (err) {
+            console.error('Failed to fetch marketplace invites:', err);
+        }
+    }, [currentUser.id]);
+
     useEffect(() => {
         fetchWorkflows();
+        fetchInvites();
         // Poll for updates every 5 seconds
-        const interval = setInterval(fetchWorkflows, 5000);
+        const interval = setInterval(() => {
+            fetchWorkflows();
+            fetchInvites();
+        }, 5000);
         return () => clearInterval(interval);
-    }, [fetchWorkflows]);
+    }, [fetchInvites, fetchWorkflows]);
 
     const handleCreateWorkflow = async () => {
         if (!newTopic.trim() || creating) return;
@@ -123,6 +155,30 @@ const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSe
         }
     };
 
+    const handleAcceptInvite = async (invite: MarketplaceInvite) => {
+        if (acceptingInviteId !== null) return;
+        setAcceptingInviteId(invite.volunteer_id);
+        try {
+            const res = await axios.post(
+                `${import.meta.env.VITE_API_URL}/api/marketplace/${invite.request.id}/accept`,
+                {
+                    volunteer_id: invite.volunteer_id,
+                    user_id: currentUser.id
+                }
+            );
+            toast.success('Collaboration started.');
+            setInvites((prev) => prev.filter((item) => item.volunteer_id !== invite.volunteer_id));
+            onSelectWorkflow(res.data.workflow_id);
+        } catch (err) {
+            const errorMsg = axios.isAxiosError(err)
+                ? err.response?.data?.error || 'Failed to accept request.'
+                : 'Failed to accept request.';
+            toast.error(errorMsg);
+        } finally {
+            setAcceptingInviteId(null);
+        }
+    };
+
     const formatDate = (dateStr: string) => {
         if (!dateStr) return '';
         const d = new Date(dateStr);
@@ -160,15 +216,6 @@ const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSe
                         Manage research and presentation workflows
                     </p>
                 </div>
-                {currentUser.role === 'researcher' && (
-                    <button
-                        onClick={() => setShowNewForm(!showNewForm)}
-                        className="btn btn-primary"
-                        id="new-workflow-btn"
-                    >
-                        <span>+</span> New Request
-                    </button>
-                )}
             </div>
 
             {/* New Workflow Form */}
@@ -207,6 +254,72 @@ const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSe
                     </p>
                 </div>
             )}
+
+            {/* Pending Collaboration Requests */}
+            <section className="mb-8">
+                <h3 className="text-sm font-semibold text-[var(--color-text-secondary)] uppercase tracking-wider mb-3">
+                    Pending Collaboration Requests ({invites.length})
+                </h3>
+                {invites.length === 0 ? (
+                    <div className="glass-card-static p-6 text-center">
+                        <p className="text-[var(--color-text-muted)] text-sm">No direct invites right now.</p>
+                    </div>
+                ) : (
+                    <div className="space-y-3">
+                        {invites.map((invite) => (
+                            <div
+                                key={invite.volunteer_id}
+                                onClick={() => onSelectRequest(invite.request.id)}
+                                onKeyDown={(event) => {
+                                    if (event.key !== 'Enter' && event.key !== ' ') return;
+                                    event.preventDefault();
+                                    onSelectRequest(invite.request.id);
+                                }}
+                                role="button"
+                                tabIndex={0}
+                                className="glass-card-static p-5 flex flex-col sm:flex-row sm:items-center gap-4"
+                            >
+                                <div className="flex-1 min-w-0">
+                                    <p className="text-xs text-purple-300 uppercase tracking-wider mb-1">
+                                        Invited by {invite.request.requester?.name || 'Requester'}
+                                    </p>
+                                    <h4 className="text-white font-medium truncate">{invite.request.title}</h4>
+                                    <p className="text-xs text-[var(--color-text-muted)] mt-1 line-clamp-2">
+                                        {invite.request.description}
+                                    </p>
+                                    <div className="flex flex-wrap gap-2 mt-2">
+                                        {invite.request.required_capabilities.slice(0, 4).map((cap) => (
+                                            <span
+                                                key={cap}
+                                                className="bg-[var(--color-surface)] border border-[var(--color-border)] px-2 py-0.5 rounded text-[10px] text-[var(--color-text-secondary)] uppercase"
+                                            >
+                                                {cap}
+                                            </span>
+                                        ))}
+                                    </div>
+                                </div>
+                                <div className="flex items-center gap-3 sm:flex-col sm:items-end">
+                                    <p className="text-xs text-[var(--color-text-muted)]">
+                                        {formatDate(invite.request.created_at)}
+                                    </p>
+                                    <button
+                                        onClick={(event) => {
+                                            event.stopPropagation();
+                                            void handleAcceptInvite(invite);
+                                        }}
+                                        onKeyDown={(event) => event.stopPropagation()}
+                                        disabled={acceptingInviteId === invite.volunteer_id}
+                                        className="btn btn-primary px-4 py-2 text-xs"
+                                        id={`accept-invite-btn-${invite.volunteer_id}`}
+                                    >
+                                        {acceptingInviteId === invite.volunteer_id ? 'Starting...' : 'Accept & Start'}
+                                    </button>
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                )}
+            </section>
 
             {/* Active Workflows */}
             <section className="mb-8">

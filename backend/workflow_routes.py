@@ -30,8 +30,7 @@ from database import SessionLocal
 from crud import (
     get_all_users, get_user_by_id,
     create_workflow, get_workflow_by_id,
-    get_all_workflows, get_workflows_by_user,
-    get_workflows_assigned_to_user,
+    get_all_workflows,
     delete_workflow,
     update_workflow_status,
     create_workflow_step, get_active_step,
@@ -39,7 +38,8 @@ from crud import (
     create_event,
     get_open_work_requests, get_work_request_by_id,
     create_work_request, create_volunteer,
-    update_volunteer_status, get_volunteer_by_id,
+    get_pending_invites_for_user,
+    get_volunteer_by_id,
     create_workflow_message, get_messages_for_workflow,
     upsert_workflow_approval, get_workflow_approvals
 )
@@ -1424,6 +1424,138 @@ def _process_slack_approval(workflow_id: int, slack_user_id: str,
 # Marketplace Endpoints
 # ──────────────────────────────────────
 
+def _complete_marketplace_handshake(db, work_request, volunteer):
+    """
+    Accept a volunteer/invite and create the collaboration workflow.
+    Returns (workflow, should_send_agent_kickoff, kickoff_prompt).
+    """
+    user = volunteer.user
+    if not user:
+        raise ValueError("Selected volunteer user not found")
+
+    # 1. Update marketplace statuses
+    volunteer.status = "accepted"
+    work_request.status = "assigned"
+    for other in work_request.volunteers:
+        if other.id != volunteer.id and other.status == "pending":
+            other.status = "rejected"
+
+    # 2. Create the actual Workflow from the request
+    session_id = f"workflow-{generate_session_id()}"
+    workflow_type = _infer_workflow_type(
+        work_request.title,
+        work_request.description,
+        work_request.required_capabilities
+    )
+    requires_research = user.is_agent and _should_auto_start_agent(work_request.required_capabilities)
+    auto_start_agent = False
+
+    workflow = create_workflow(
+        db,
+        user_id=work_request.requester_id,
+        title=work_request.title,
+        workflow_type=workflow_type,
+        openclaw_session_id=session_id,
+        parent_id=work_request.parent_workflow_id
+    )
+
+    # 3. Create the first step and assign it
+    if user.is_agent:
+        step_type = "agent_collaboration"
+    elif workflow_type in ("compliance_review", "design_alignment"):
+        step_type = "specialist_review"
+    else:
+        step_type = "human_research"
+    provider_type = "agent" if user.is_agent else "human"
+
+    initial_step = create_workflow_step(
+        db, workflow_id=workflow.id, step_order=1,
+        step_type=step_type, provider_type=provider_type,
+        assigned_to=user.id,
+        input_data={
+            "topic": (work_request.description or "").strip() or work_request.title,
+            "title": work_request.title,
+            "description": work_request.description,
+            "workflow_type": workflow_type,
+            "request_id": work_request.id,
+            "requires_research": requires_research
+        }
+    )
+
+    # 4. Success event
+    create_event(
+        db, workflow_id=workflow.id, event_type="created",
+        actor_id=work_request.requester_id, actor_type="human", channel="web",
+        message=f"Handshake complete! {user.name} is starting work on: {work_request.title}"
+    )
+
+    # 5. Seed collaboration chat + approvals for collaborative paths
+    should_send_agent_kickoff = False
+    kickoff_prompt = (
+        "Please acknowledge the requester description for this workflow, "
+        "summarize the requirements you will follow, and ask whether they "
+        "want to refine anything before pressing 'Start Agent Research'."
+    )
+
+    if not auto_start_agent:
+        update_step_status(db, initial_step.id, "in_progress")
+        update_workflow_status(db, workflow.id, "collaborating")
+        create_workflow_message(
+            db,
+            workflow_id=workflow.id,
+            sender_type="system",
+            channel="system",
+            message=(
+                f"{work_request.requester.name} and {user.name} are now connected. "
+                "Use this chat to collaborate, refine, and confirm completion."
+            )
+        )
+        if requires_research:
+            create_workflow_message(
+                db,
+                workflow_id=workflow.id,
+                sender_type="system",
+                channel="system",
+                message=(
+                    "Research has not started yet. Let the agent propose a first-step plan in chat, "
+                    "then requester uses 'Start Agent Research' when ready."
+                )
+            )
+            should_send_agent_kickoff = True
+
+    if not user.is_agent:
+        upsert_workflow_approval(db, workflow.id, work_request.requester_id, "pending")
+        upsert_workflow_approval(db, workflow.id, user.id, "pending")
+
+    db.commit()
+    return workflow, should_send_agent_kickoff, kickoff_prompt
+
+
+@workflow_bp.route('/api/marketplace/invites', methods=['GET'])
+def list_marketplace_invites():
+    """List pending marketplace invites for a user."""
+    db = SessionLocal()
+    try:
+        user_id = request.args.get("user_id", type=int)
+        if not user_id:
+            return jsonify({"error": "user_id is required"}), 400
+
+        invites = get_pending_invites_for_user(db, user_id)
+        invite_payload = []
+        for invite in invites:
+            work_request = invite.request
+            if not work_request:
+                continue
+            invite_payload.append({
+                "volunteer_id": invite.id,
+                "request": work_request.to_dict()
+            })
+
+        return jsonify({"invites": invite_payload}), 200
+    finally:
+        db.close()
+
+
 @workflow_bp.route('/api/marketplace', methods=['GET'])
 def list_marketplace():
     """List all open work requests on the marketplace board."""
@@ -1449,8 +1581,51 @@ def post_work_request():
         if not data:
             return jsonify({"error": "Request body missing"}), 400
 
+        requester_id_raw = data.get("requester_id")
+        if requester_id_raw is None:
+            return jsonify({"error": "requester_id is required"}), 400
+        try:
+            requester_id = int(requester_id_raw)
+        except (TypeError, ValueError):
+            return jsonify({"error": "requester_id must be a number"}), 400
+
+        requester = get_user_by_id(db, requester_id)
+        if not requester:
+            return jsonify({"error": "Requester not found"}), 404
+
         # Create the request
         work_request = create_work_request(db, data)
+
+        # Optional targeted personas from the post form.
+        selected_persona_ids_raw = data.get("selected_persona_ids") or []
+        selected_persona_ids: list[int] = []
+        if isinstance(selected_persona_ids_raw, list):
+            for raw_id in selected_persona_ids_raw:
+                try:
+                    persona_id = int(raw_id)
+                except (TypeError, ValueError):
+                    continue
+                if persona_id <= 0 or persona_id == requester_id or persona_id in selected_persona_ids:
+                    continue
+                selected_persona_ids.append(persona_id)
+
+        selected_personas = []
+        for persona_id in selected_persona_ids:
+            user = get_user_by_id(db, persona_id)
+            if user and user.is_active:
+                selected_personas.append(user)
+
+        invited_user_ids: set[int] = set()
+        auto_accept_invite = None
+        for persona in selected_personas:
+            volunteer = create_volunteer(db, {
+                "request_id": work_request.id,
+                "user_id": persona.id,
+                "note": f"Direct invite from {requester.name}."
+            })
+            invited_user_ids.add(persona.id)
+            if persona.is_agent and auto_accept_invite is None:
+                auto_accept_invite = volunteer
 
         # ── AGENT AUTO-VOLUNTEER LOGIC ──
         required_caps = _normalize_caps(data.get("required_capabilities", []))
@@ -1467,6 +1642,8 @@ def post_work_request():
             for agent in agents:
                 if agent.email != "agent@openclaw.ai":
                     continue
+                if agent.id in invited_user_ids:
+                    continue
                 create_volunteer(db, {
                     "request_id": work_request.id,
                     "user_id": agent.id,
@@ -1476,11 +1653,26 @@ def post_work_request():
                     )
                 })
 
+        # If an agent was explicitly selected, auto-accept immediately.
+        if auto_accept_invite and work_request.status == "open" and auto_accept_invite.status == "pending":
+            workflow, should_send_agent_kickoff, kickoff_prompt = _complete_marketplace_handshake(
+                db, work_request, auto_accept_invite
+            )
+            if should_send_agent_kickoff:
+                start_agent_chat_reply(workflow.id, kickoff_prompt)
+            return jsonify({
+                "message": "Work request posted and agent accepted automatically.",
+                "request": work_request.to_dict(),
+                "workflow_id": workflow.id,
+                "workflow_type": workflow.workflow_type
+            }), 201
+
         return jsonify({
             "message": "Work request posted to marketplace!",
             "request": work_request.to_dict()
         }), 201
     except Exception as e:
+        db.rollback()
         print(f"Error posting work request: {e}")
         return jsonify({"error": str(e)}), 500
     finally:
@@ -1546,13 +1738,18 @@ def accept_volunteer(request_id):
     db = SessionLocal()
     try:
         data = request.json or {}
-        volunteer_id = data.get("volunteer_id")
-        requester_id = data.get("user_id")
+        volunteer_id_raw = data.get("volunteer_id")
+        actor_id_raw = data.get("user_id")
 
-        if not volunteer_id:
+        if volunteer_id_raw is None:
             return jsonify({"error": "volunteer_id is required"}), 400
-        if not requester_id:
+        if actor_id_raw is None:
             return jsonify({"error": "user_id is required"}), 400
+        try:
+            volunteer_id = int(volunteer_id_raw)
+            actor_id = int(actor_id_raw)
+        except (TypeError, ValueError):
+            return jsonify({"error": "volunteer_id and user_id must be numbers"}), 400
 
         work_request = get_work_request_by_id(db, request_id)
         volunteer = get_volunteer_by_id(db, volunteer_id)
@@ -1565,105 +1762,14 @@ def accept_volunteer(request_id):
             return jsonify({"error": f"Request is already {work_request.status}"}), 400
         if volunteer.status != "pending":
             return jsonify({"error": f"Volunteer is already {volunteer.status}"}), 400
-        if requester_id != work_request.requester_id:
-            return jsonify({"error": "Only the requester can accept a volunteer"}), 403
+        if actor_id not in (work_request.requester_id, volunteer.user_id):
+            return jsonify({"error": "Only the requester or invited persona can accept"}), 403
+        if actor_id == volunteer.user_id and not (volunteer.note or "").startswith("Direct invite"):
+            return jsonify({"error": "Only requesters can accept non-invite volunteers"}), 403
 
-        # 1. Update statuses
-        update_volunteer_status(db, volunteer_id, "accepted")
-        work_request.status = "assigned"
-        for other in work_request.volunteers:
-            if other.id != volunteer_id and other.status == "pending":
-                update_volunteer_status(db, other.id, "rejected")
-
-        # 2. Create the actual Workflow from the request
-        user = volunteer.user
-        session_id = f"workflow-{generate_session_id()}"
-        workflow_type = _infer_workflow_type(
-            work_request.title,
-            work_request.description,
-            work_request.required_capabilities
+        workflow, should_send_agent_kickoff, kickoff_prompt = _complete_marketplace_handshake(
+            db, work_request, volunteer
         )
-        requires_research = user.is_agent and _should_auto_start_agent(work_request.required_capabilities)
-        auto_start_agent = False
-
-        workflow = create_workflow(
-            db,
-            user_id=work_request.requester_id,
-            title=work_request.title,
-            workflow_type=workflow_type,
-            openclaw_session_id=session_id,
-            parent_id=work_request.parent_workflow_id
-        )
-
-        # 3. Create the first step and assign it
-        if user.is_agent:
-            step_type = "agent_collaboration"
-        elif workflow_type in ("compliance_review", "design_alignment"):
-            step_type = "specialist_review"
-        else:
-            step_type = "human_research"
-        provider_type = "agent" if user.is_agent else "human"
-
-        initial_step = create_workflow_step(
-            db, workflow_id=workflow.id, step_order=1,
-            step_type=step_type, provider_type=provider_type,
-            assigned_to=user.id,
-            input_data={
-                "topic": (work_request.description or "").strip() or work_request.title,
-                "title": work_request.title,
-                "description": work_request.description,
-                "workflow_type": workflow_type,
-                "request_id": work_request.id,
-                "requires_research": requires_research
-            }
-        )
-
-        # 4. Success event
-        create_event(
-            db, workflow_id=workflow.id, event_type="created",
-            actor_id=work_request.requester_id, actor_type="human", channel="web",
-            message=f"Handshake complete! {user.name} is starting work on: {work_request.title}"
-        )
-
-        # 5. Seed collaboration chat + approvals for collaborative paths
-        should_send_agent_kickoff = False
-        kickoff_prompt = (
-            "Please acknowledge the requester description for this workflow, "
-            "summarize the requirements you will follow, and ask whether they "
-            "want to refine anything before pressing 'Start Agent Research'."
-        )
-
-        if not auto_start_agent:
-            update_step_status(db, initial_step.id, "in_progress")
-            update_workflow_status(db, workflow.id, "collaborating")
-            create_workflow_message(
-                db,
-                workflow_id=workflow.id,
-                sender_type="system",
-                channel="system",
-                message=(
-                    f"{work_request.requester.name} and {user.name} are now connected. "
-                    "Use this chat to collaborate, refine, and confirm completion."
-                )
-            )
-            if requires_research:
-                create_workflow_message(
-                    db,
-                    workflow_id=workflow.id,
-                    sender_type="system",
-                    channel="system",
-                    message=(
-                        "Research has not started yet. Let the agent propose a first-step plan in chat, "
-                        "then requester uses 'Start Agent Research' when ready."
-                    )
-                )
-                should_send_agent_kickoff = True
-
-        if not user.is_agent:
-            upsert_workflow_approval(db, workflow.id, work_request.requester_id, "pending")
-            upsert_workflow_approval(db, workflow.id, user.id, "pending")
-
-        db.commit()
         if should_send_agent_kickoff:
             start_agent_chat_reply(workflow.id, kickoff_prompt)
         return jsonify({
@@ -1685,6 +1791,7 @@ def accept_volunteer(request_id):
 # ──────────────────────────────────────
 
 @workflow_bp.route('/api/marketplace', methods=['OPTIONS'])
+@workflow_bp.route('/api/marketplace/invites', methods=['OPTIONS'])
 @workflow_bp.route('/api/marketplace/<int:request_id>', methods=['OPTIONS'])
 @workflow_bp.route('/api/marketplace/<int:request_id>/volunteer', methods=['OPTIONS'])
 @workflow_bp.route('/api/marketplace/<int:request_id>/accept', methods=['OPTIONS'])

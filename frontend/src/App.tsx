@@ -82,6 +82,7 @@ const App: React.FC = () => {
         <WorkflowDashboard
           currentUser={currentUser}
           onSelectWorkflow={handleSelectWorkflow}
+          onSelectRequest={handleSelectRequest}
         />
       )}
 

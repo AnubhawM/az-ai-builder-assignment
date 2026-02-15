@@ -10,6 +10,15 @@ interface User {
     email: string;
 }
 
+interface Persona {
+    id: number;
+    name: string;
+    role: string;
+    email: string;
+    is_agent: boolean;
+    is_active: boolean;
+}
+
 interface Volunteer {
     id: number;
     user_id: number;
@@ -49,11 +58,13 @@ const CAPABILITY_OPTIONS = [
 
 const Marketplace: React.FC<MarketplaceProps> = ({ currentUser, onSelectRequest }) => {
     const [requests, setRequests] = useState<WorkRequest[]>([]);
+    const [personas, setPersonas] = useState<Persona[]>([]);
     const [loading, setLoading] = useState(true);
     const [showPostForm, setShowPostForm] = useState(false);
     const [newTitle, setNewTitle] = useState('');
     const [newDesc, setNewDesc] = useState('');
     const [newCaps, setNewCaps] = useState<string[]>(['research']);
+    const [selectedPersonaIds, setSelectedPersonaIds] = useState<number[]>([]);
     const [posting, setPosting] = useState(false);
 
     const fetchRequests = useCallback(async () => {
@@ -67,11 +78,24 @@ const Marketplace: React.FC<MarketplaceProps> = ({ currentUser, onSelectRequest 
         }
     }, []);
 
+    const fetchPersonas = useCallback(async () => {
+        try {
+            const res = await axios.get(`${import.meta.env.VITE_API_URL}/api/users`);
+            const available = (res.data.users || []).filter(
+                (u: Persona) => u.id !== currentUser.id
+            );
+            setPersonas(available);
+        } catch (err) {
+            console.error('Failed to fetch personas:', err);
+        }
+    }, [currentUser.id]);
+
     useEffect(() => {
         fetchRequests();
+        fetchPersonas();
         const interval = setInterval(fetchRequests, 5000);
         return () => clearInterval(interval);
-    }, [fetchRequests]);
+    }, [fetchRequests, fetchPersonas]);
 
     const handlePostRequest = async () => {
         if (!newTitle.trim() || !newDesc.trim() || posting) return;
@@ -82,11 +106,13 @@ const Marketplace: React.FC<MarketplaceProps> = ({ currentUser, onSelectRequest 
                 description: newDesc.trim(),
                 requester_id: currentUser.id,
                 required_capabilities: newCaps,
+                selected_persona_ids: selectedPersonaIds,
             });
             toast.success('Work request posted to marketplace!');
             setNewTitle('');
             setNewDesc('');
             setNewCaps(['research']);
+            setSelectedPersonaIds([]);
             setShowPostForm(false);
             fetchRequests();
         } catch (err) {
@@ -108,6 +134,14 @@ const Marketplace: React.FC<MarketplaceProps> = ({ currentUser, onSelectRequest 
     const handleCapabilitySelection = (event: React.ChangeEvent<HTMLSelectElement>) => {
         const selected = Array.from(event.target.selectedOptions).map((option) => option.value);
         setNewCaps(selected);
+    };
+
+    const handlePersonaToggle = (personaId: number) => {
+        setSelectedPersonaIds((prev) =>
+            prev.includes(personaId)
+                ? prev.filter((id) => id !== personaId)
+                : [...prev, personaId]
+        );
     };
 
     if (loading) {
@@ -181,6 +215,46 @@ const Marketplace: React.FC<MarketplaceProps> = ({ currentUser, onSelectRequest 
                             </select>
                             <p className="text-[11px] text-[var(--color-text-muted)] mt-1">
                                 Hold Cmd/Ctrl to select multiple capabilities.
+                            </p>
+                        </div>
+                        <div>
+                            <label className="block text-xs font-medium text-[var(--color-text-muted)] uppercase mb-2">
+                                Invite Specific Personas (Optional)
+                            </label>
+                            {personas.length === 0 ? (
+                                <p className="text-xs text-[var(--color-text-muted)]">
+                                    No other personas available right now.
+                                </p>
+                            ) : (
+                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                                    {personas.map((persona) => {
+                                        const selected = selectedPersonaIds.includes(persona.id);
+                                        return (
+                                            <button
+                                                key={persona.id}
+                                                type="button"
+                                                onClick={() => handlePersonaToggle(persona.id)}
+                                                className={`text-left border rounded-lg px-3 py-2 ${selected
+                                                    ? 'border-purple-400 bg-purple-500/10'
+                                                    : 'border-[var(--color-border)] bg-[var(--color-surface)]'
+                                                    }`}
+                                            >
+                                                <p className="text-sm text-white font-medium">
+                                                    {persona.name}
+                                                    {persona.is_agent && (
+                                                        <span className="ml-2 text-[10px] text-emerald-300 uppercase">Agent</span>
+                                                    )}
+                                                </p>
+                                                <p className="text-xs text-[var(--color-text-muted)]">
+                                                    {persona.role.replace('_', ' ')}
+                                                </p>
+                                            </button>
+                                        );
+                                    })}
+                                </div>
+                            )}
+                            <p className="text-[11px] text-[var(--color-text-muted)] mt-2">
+                                Invited personas will see this as a pending request in My Workflows.
                             </p>
                         </div>
                         <div className="flex justify-end gap-3 pt-2">

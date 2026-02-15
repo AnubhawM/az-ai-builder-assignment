@@ -365,6 +365,24 @@ def get_open_work_requests(db: Session) -> list[WorkRequest]:
     )
 
 
+def get_pending_invites_for_user(db: Session, user_id: int) -> list[Volunteer]:
+    """
+    Get open marketplace requests where this user has a pending invite.
+    """
+    return (
+        db.query(Volunteer)
+        .join(WorkRequest, Volunteer.request_id == WorkRequest.id)
+        .filter(
+            Volunteer.user_id == user_id,
+            Volunteer.status == "pending",
+            WorkRequest.status == "open",
+            Volunteer.note.like("Direct invite%")
+        )
+        .order_by(Volunteer.created_at.desc())
+        .all()
+    )
+
+
 def create_volunteer(db: Session, volunteer_data: dict) -> Volunteer:
     new_volunteer = Volunteer(
         request_id=volunteer_data['request_id'],
