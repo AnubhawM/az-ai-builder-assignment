@@ -1,6 +1,7 @@
 // src/components/WorkflowDashboard.tsx
 import React, { useEffect, useState, useCallback } from 'react';
 import axios from 'axios';
+import { toast } from 'react-toastify';
 
 interface User {
     id: number;
@@ -11,6 +12,7 @@ interface User {
 
 interface WorkflowSummary {
     id: number;
+    user_id: number;
     title: string;
     status: string;
     workflow_type: string;
@@ -20,9 +22,24 @@ interface WorkflowSummary {
     steps: Array<{ step_type: string; status: string; iteration_count: number }>;
 }
 
+interface InviteRequest {
+    id: number;
+    title: string;
+    description: string;
+    required_capabilities: string[];
+    created_at: string;
+    requester: { name: string; role: string } | null;
+}
+
+interface MarketplaceInvite {
+    volunteer_id: number;
+    request: InviteRequest;
+}
+
 interface WorkflowDashboardProps {
     currentUser: User;
     onSelectWorkflow: (workflowId: number) => void;
+    onSelectRequest: (requestId: number) => void;
 }
 
 const statusConfig: Record<string, { label: string; badge: string; icon: string }> = {
@@ -36,12 +53,14 @@ const statusConfig: Record<string, { label: string; badge: string; icon: string 
     failed: { label: 'Failed', badge: 'badge-error', icon: '❌' },
 };
 
-const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSelectWorkflow }) => {
+const runningWorkflowStatuses = new Set(['researching', 'refining', 'generating_ppt']);
+
+const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSelectWorkflow, onSelectRequest }) => {
     const [workflows, setWorkflows] = useState<WorkflowSummary[]>([]);
+    const [invites, setInvites] = useState<MarketplaceInvite[]>([]);
     const [loading, setLoading] = useState(true);
-    const [showNewForm, setShowNewForm] = useState(false);
-    const [newTopic, setNewTopic] = useState('');
-    const [creating, setCreating] = useState(false);
+    const [deletingWorkflowId, setDeletingWorkflowId] = useState<number | null>(null);
+    const [acceptingInviteId, setAcceptingInviteId] = useState<number | null>(null);
 
     const fetchWorkflows = useCallback(async () => {
         try {
@@ -56,30 +75,84 @@ const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSe
         }
     }, [currentUser.id]);
 
+    const fetchInvites = useCallback(async () => {
+        try {
+            const res = await axios.get(`${import.meta.env.VITE_API_URL}/api/marketplace/invites`, {
+                params: { user_id: currentUser.id }
+            });
+            setInvites(res.data.invites || []);
+        } catch (err) {
+            console.error('Failed to fetch marketplace invites:', err);
+        }
+    }, [currentUser.id]);
+
     useEffect(() => {
         fetchWorkflows();
+        fetchInvites();
         // Poll for updates every 5 seconds
-        const interval = setInterval(fetchWorkflows, 5000);
+        const interval = setInterval(() => {
+            fetchWorkflows();
+            fetchInvites();
+        }, 5000);
         return () => clearInterval(interval);
-    }, [fetchWorkflows]);
+    }, [fetchInvites, fetchWorkflows]);
 
-    const handleCreateWorkflow = async () => {
-        if (!newTopic.trim() || creating) return;
-        setCreating(true);
+    const handleCardKeyDown = (event: React.KeyboardEvent<HTMLDivElement>, workflowId: number) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        onSelectWorkflow(workflowId);
+    };
+
+    const handleDeleteWorkflow = async (workflow: WorkflowSummary) => {
+        if (deletingWorkflowId !== null) return;
+        if (runningWorkflowStatuses.has(workflow.status)) {
+            toast.error('Cancel the active run before deleting this workflow.');
+            return;
+        }
+        const confirmed = window.confirm(
+            `Delete "${workflow.title}"? This action cannot be undone.`
+        );
+        if (!confirmed) return;
+
+        setDeletingWorkflowId(workflow.id);
         try {
-            const res = await axios.post(`${import.meta.env.VITE_API_URL}/api/workflows`, {
-                topic: newTopic.trim(),
-                user_id: currentUser.id,
-                workflow_type: 'ppt_generation',
+            await axios.delete(`${import.meta.env.VITE_API_URL}/api/workflows/${workflow.id}`, {
+                data: { user_id: currentUser.id }
             });
-            setNewTopic('');
-            setShowNewForm(false);
-            // Navigate to the newly created workflow
-            onSelectWorkflow(res.data.workflow.id);
+            setWorkflows((prev) => prev.filter((item) => item.id !== workflow.id));
+            toast.success('Workflow deleted.');
         } catch (err) {
-            console.error('Failed to create workflow:', err);
+            const errorMsg = axios.isAxiosError(err)
+                ? err.response?.data?.error || 'Failed to delete workflow.'
+                : 'Failed to delete workflow.';
+            toast.error(errorMsg);
+            console.error('Failed to delete workflow:', err);
         } finally {
-            setCreating(false);
+            setDeletingWorkflowId(null);
+        }
+    };
+
+    const handleAcceptInvite = async (invite: MarketplaceInvite) => {
+        if (acceptingInviteId !== null) return;
+        setAcceptingInviteId(invite.volunteer_id);
+        try {
+            const res = await axios.post(
+                `${import.meta.env.VITE_API_URL}/api/marketplace/${invite.request.id}/accept`,
+                {
+                    volunteer_id: invite.volunteer_id,
+                    user_id: currentUser.id
+                }
+            );
+            toast.success('Collaboration started.');
+            setInvites((prev) => prev.filter((item) => item.volunteer_id !== invite.volunteer_id));
+            onSelectWorkflow(res.data.workflow_id);
+        } catch (err) {
+            const errorMsg = axios.isAxiosError(err)
+                ? err.response?.data?.error || 'Failed to accept request.'
+                : 'Failed to accept request.';
+            toast.error(errorMsg);
+        } finally {
+            setAcceptingInviteId(null);
         }
     };
 
@@ -120,53 +193,72 @@ const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSe
                         Manage research and presentation workflows
                     </p>
                 </div>
-                {currentUser.role === 'researcher' && (
-                    <button
-                        onClick={() => setShowNewForm(!showNewForm)}
-                        className="btn btn-primary"
-                        id="new-workflow-btn"
-                    >
-                        <span>+</span> New Request
-                    </button>
-                )}
             </div>
-
-            {/* New Workflow Form */}
-            {showNewForm && (
-                <div className="glass-card p-6 mb-6">
-                    <h3 className="text-white font-semibold mb-3">Create New Research Workflow</h3>
-                    <div className="flex gap-3">
-                        <input
-                            type="text"
-                            value={newTopic}
-                            onChange={(e) => setNewTopic(e.target.value)}
-                            placeholder="Enter a research topic (e.g., Sustainable energy technologies for AZ manufacturing)"
-                            className="flex-1 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg px-4 py-3 text-white text-sm placeholder:text-[var(--color-text-muted)] focus:outline-none focus:border-purple-500"
-                            onKeyDown={(e) => e.key === 'Enter' && handleCreateWorkflow()}
-                            disabled={creating}
-                            id="new-workflow-topic"
-                        />
-                        <button
-                            onClick={handleCreateWorkflow}
-                            disabled={!newTopic.trim() || creating}
-                            className="btn btn-primary whitespace-nowrap"
-                            id="submit-workflow-btn"
-                        >
-                            {creating ? (
-                                <>
-                                    <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin-slow" />
-                                    Starting...
-                                </>
-                            ) : (
-                                'Start Research'
-                            )}
-                        </button>
+            {/* Pending Collaboration Requests */}
+            <section className="mb-8">
+                <h3 className="text-sm font-semibold text-[var(--color-text-secondary)] uppercase tracking-wider mb-3">
+                    Pending Collaboration Requests ({invites.length})
+                </h3>
+                {invites.length === 0 ? (
+                    <div className="glass-card-static p-6 text-center">
+                        <p className="text-[var(--color-text-muted)] text-sm">No direct invites right now.</p>
                     </div>
-                    <p className="text-[var(--color-text-muted)] text-xs mt-2">
-                        OpenClaw will research the topic and produce an executive summary and slide outline for your review.
-                    </p>
-                </div>
-            )}
+                ) : (
+                    <div className="space-y-3">
+                        {invites.map((invite) => (
+                            <div
+                                key={invite.volunteer_id}
+                                onClick={() => onSelectRequest(invite.request.id)}
+                                onKeyDown={(event) => {
+                                    if (event.key !== 'Enter' && event.key !== ' ') return;
+                                    event.preventDefault();
+                                    onSelectRequest(invite.request.id);
+                                }}
+                                role="button"
+                                tabIndex={0}
+                                className="glass-card-static p-5 flex flex-col sm:flex-row sm:items-center gap-4"
+                            >
+                                <div className="flex-1 min-w-0">
+                                    <p className="text-xs text-purple-300 uppercase tracking-wider mb-1">
+                                        Invited by {invite.request.requester?.name || 'Requester'}
+                                    </p>
+                                    <h4 className="text-white font-medium truncate">{invite.request.title}</h4>
+                                    <p className="text-xs text-[var(--color-text-muted)] mt-1 line-clamp-2">
+                                        {invite.request.description}
+                                    </p>
+                                    <div className="flex flex-wrap gap-2 mt-2">
+                                        {invite.request.required_capabilities.slice(0, 4).map((cap) => (
+                                            <span
+                                                key={cap}
+                                                className="bg-[var(--color-surface)] border border-[var(--color-border)] px-2 py-0.5 rounded text-[10px] text-[var(--color-text-secondary)] uppercase"
+                                            >
+                                                {cap}
+                                            </span>
+                                        ))}
+                                    </div>
+                                </div>
+                                <div className="flex items-center gap-3 sm:flex-col sm:items-end">
+                                    <p className="text-xs text-[var(--color-text-muted)]">
+                                        {formatDate(invite.request.created_at)}
+                                    </p>
+                                    <button
+                                        onClick={(event) => {
+                                            event.stopPropagation();
+                                            void handleAcceptInvite(invite);
+                                        }}
+                                        onKeyDown={(event) => event.stopPropagation()}
+                                        disabled={acceptingInviteId === invite.volunteer_id}
+                                        className="btn btn-primary px-4 py-2 text-xs"
+                                        id={`accept-invite-btn-${invite.volunteer_id}`}
+                                    >
+                                        {acceptingInviteId === invite.volunteer_id ? 'Starting...' : 'Accept & Start'}
+                                    </button>
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                )}
+            </section>
 
             {/* Active Workflows */}
             <section className="mb-8">
@@ -176,9 +268,7 @@ const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSe
                 {activeWorkflows.length === 0 ? (
                     <div className="glass-card-static p-8 text-center">
                         <p className="text-[var(--color-text-muted)]">
-                            {currentUser.role === 'researcher'
-                                ? 'No active workflows. Click "New Request" to start one.'
-                                : 'No workflows awaiting your input.'}
+                            No workflows awaiting your input.
                         </p>
                     </div>
                 ) : (
@@ -186,9 +276,12 @@ const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSe
                         {activeWorkflows.map((w) => {
                             const status = statusConfig[w.status] || statusConfig.pending;
                             return (
-                                <button
+                                <div
                                     key={w.id}
                                     onClick={() => onSelectWorkflow(w.id)}
+                                    onKeyDown={(e) => handleCardKeyDown(e, w.id)}
+                                    role="button"
+                                    tabIndex={0}
                                     className="glass-card w-full p-5 text-left flex items-center gap-4 cursor-pointer"
                                     id={`workflow-card-${w.id}`}
                                 >
@@ -208,19 +301,35 @@ const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSe
                                         </div>
                                     </div>
 
-                                    {/* Meta */}
-                                    <div className="text-right flex-shrink-0 hidden sm:block">
-                                        <p className="text-xs text-[var(--color-text-muted)]">
-                                            {w.owner?.name || 'Unknown'}
-                                        </p>
-                                        <p className="text-xs text-[var(--color-text-muted)] mt-0.5">
-                                            {formatDate(w.updated_at || w.created_at)}
-                                        </p>
+                                    {/* Meta + Actions */}
+                                    <div className="flex items-center gap-3 flex-shrink-0">
+                                        <div className="text-right hidden sm:block">
+                                            <p className="text-xs text-[var(--color-text-muted)]">
+                                                {w.owner?.name || 'Unknown'}
+                                            </p>
+                                            <p className="text-xs text-[var(--color-text-muted)] mt-0.5">
+                                                {formatDate(w.updated_at || w.created_at)}
+                                            </p>
+                                        </div>
+                                        {w.user_id === currentUser.id && (
+                                            <button
+                                                onClick={(e) => {
+                                                    e.stopPropagation();
+                                                    void handleDeleteWorkflow(w);
+                                                }}
+                                                onKeyDown={(e) => e.stopPropagation()}
+                                                disabled={deletingWorkflowId === w.id}
+                                                className="btn btn-ghost text-xs px-3 py-1.5 text-red-300"
+                                                id={`delete-workflow-btn-${w.id}`}
+                                            >
+                                                {deletingWorkflowId === w.id ? 'Deleting...' : 'Delete'}
+                                            </button>
+                                        )}
                                     </div>
 
                                     {/* Arrow */}
                                     <span className="text-[var(--color-text-muted)] text-lg flex-shrink-0">›</span>
-                                </button>
+                                </div>
                             );
                         })}
                     </div>
@@ -241,9 +350,12 @@ const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSe
                         {completedWorkflows.map((w) => {
                             const status = statusConfig[w.status] || statusConfig.pending;
                             return (
-                                <button
+                                <div
                                     key={w.id}
                                     onClick={() => onSelectWorkflow(w.id)}
+                                    onKeyDown={(e) => handleCardKeyDown(e, w.id)}
+                                    role="button"
+                                    tabIndex={0}
                                     className="glass-card-static w-full p-4 text-left flex items-center gap-4 cursor-pointer"
                                 >
                                     <div className="text-xl flex-shrink-0">{status.icon}</div>
@@ -254,7 +366,21 @@ const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSe
                                     <p className="text-xs text-[var(--color-text-muted)] flex-shrink-0 hidden sm:block">
                                         {formatDate(w.created_at)}
                                     </p>
-                                </button>
+                                    {w.user_id === currentUser.id && (
+                                        <button
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                void handleDeleteWorkflow(w);
+                                            }}
+                                            onKeyDown={(e) => e.stopPropagation()}
+                                            disabled={deletingWorkflowId === w.id}
+                                            className="btn btn-ghost text-xs px-3 py-1.5 text-red-300"
+                                            id={`delete-workflow-btn-${w.id}`}
+                                        >
+                                            {deletingWorkflowId === w.id ? 'Deleting...' : 'Delete'}
+                                        </button>
+                                    )}
+                                </div>
                             );
                         })}
                     </div>

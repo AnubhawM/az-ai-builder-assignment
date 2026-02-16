@@ -230,7 +230,23 @@ body {
 }
 
 .animate-fade-in,
-.animate-slide-in,
-.animate-spin-slow {
+.animate-slide-in {
   animation: none !important;
+}
+
+@keyframes spinner-rotate {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Keep loading affordance alive with a low-cost transform animation. */
+.animate-spin-slow {
+  animation: spinner-rotate 1s linear infinite !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-spin-slow {
+    animation: none !important;
+  }
 }

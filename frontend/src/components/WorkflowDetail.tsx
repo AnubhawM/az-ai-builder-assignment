@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import axios from 'axios';
 
 interface User {
@@ -69,6 +69,15 @@ interface Workflow {
     updated_at: string;
 }
 
+interface WorkflowAttachment {
+    filename: string;
+    display_name: string;
+    extension: string;
+    size_bytes: number;
+    size_formatted: string;
+    uploaded_at: string;
+}
+
 interface WorkflowDetailProps {
     workflowId: number;
     currentUser: User;
@@ -109,6 +118,7 @@ const eventIcons: Record<string, string> = {
     reopened: '↩️',
     agent_replied: '🤖',
     notification_sent: '📨',
+    generation_warning: '⚠️',
     failed: '❌',
 };
 
@@ -123,13 +133,28 @@ const workflowStatusLabel: Record<string, string> = {
     failed: 'Failed',
 };
 
+const documentOnlyResearchExtensions = new Set(['.pdf', '.txt']);
+
 const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser, onBack }) => {
     const [workflow, setWorkflow] = useState<Workflow | null>(null);
+    const [attachments, setAttachments] = useState<WorkflowAttachment[]>([]);
+    const [submissionDocuments, setSubmissionDocuments] = useState<WorkflowAttachment[]>([]);
     const [loading, setLoading] = useState(true);
+    const [loadingAttachments, setLoadingAttachments] = useState(true);
+    const [loadingSubmissionDocuments, setLoadingSubmissionDocuments] = useState(true);
+    const [selectedAttachmentFile, setSelectedAttachmentFile] = useState<File | null>(null);
+    const [selectedSubmissionFile, setSelectedSubmissionFile] = useState<File | null>(null);
+    const [uploadingAttachment, setUploadingAttachment] = useState(false);
+    const [uploadingSubmissionDocument, setUploadingSubmissionDocument] = useState(false);
+    const [skipWebSearch, setSkipWebSearch] = useState(false);
+    const attachmentInputRef = useRef<HTMLInputElement | null>(null);
+    const submissionInputRef = useRef<HTMLInputElement | null>(null);
     const [feedback, setFeedback] = useState('');
+    const [pptVerbosity, setPptVerbosity] = useState<'concise' | 'standard' | 'text-heavy'>('standard');
     const [chatInput, setChatInput] = useState('');
     const [submitting, setSubmitting] = useState(false);
     const [sendingMessage, setSendingMessage] = useState(false);
+    const [pendingAgentReplyAfterMessageId, setPendingAgentReplyAfterMessageId] = useState<number | null>(null);
     const [updatingCompletion, setUpdatingCompletion] = useState(false);
     const [triggeringResearch, setTriggeringResearch] = useState(false);
     const [retryingGeneration, setRetryingGeneration] = useState(false);
@@ -154,11 +179,67 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
         }
     }, [workflowId, currentUser.id]);
 
+    const fetchAttachments = useCallback(async () => {
+        try {
+            const res = await axios.get(
+                `${import.meta.env.VITE_API_URL}/api/workflows/${workflowId}/attachments`,
+                { params: { user_id: currentUser.id } }
+            );
+            setAttachments(res.data.attachments || []);
+        } catch (err) {
+            console.error('Failed to fetch workflow attachments:', err);
+        } finally {
+            setLoadingAttachments(false);
+        }
+    }, [workflowId, currentUser.id]);
+
+    const fetchSubmissionDocuments = useCallback(async () => {
+        try {
+            const res = await axios.get(
+                `${import.meta.env.VITE_API_URL}/api/workflows/${workflowId}/submission-documents`,
+                { params: { user_id: currentUser.id } }
+            );
+            setSubmissionDocuments(res.data.documents || []);
+        } catch (err) {
+            console.error('Failed to fetch submission documents:', err);
+        } finally {
+            setLoadingSubmissionDocuments(false);
+        }
+    }, [workflowId, currentUser.id]);
+
     useEffect(() => {
         fetchWorkflow();
-        const interval = setInterval(fetchWorkflow, 3000);
+        fetchAttachments();
+        fetchSubmissionDocuments();
+        const interval = setInterval(() => {
+            fetchWorkflow();
+            fetchAttachments();
+            fetchSubmissionDocuments();
+        }, 3000);
         return () => clearInterval(interval);
-    }, [fetchWorkflow]);
+    }, [fetchWorkflow, fetchAttachments, fetchSubmissionDocuments]);
+
+    useEffect(() => {
+        setSkipWebSearch(false);
+        setSelectedAttachmentFile(null);
+        setSelectedSubmissionFile(null);
+        if (attachmentInputRef.current) {
+            attachmentInputRef.current.value = '';
+        }
+        if (submissionInputRef.current) {
+            submissionInputRef.current.value = '';
+        }
+    }, [workflowId]);
+
+    useEffect(() => {
+        if (!workflow || pendingAgentReplyAfterMessageId === null) return;
+        const hasAgentReply = workflow.messages.some(
+            (msg) => msg.sender_type === 'agent' && msg.id > pendingAgentReplyAfterMessageId
+        );
+        if (hasAgentReply) {
+            setPendingAgentReplyAfterMessageId(null);
+        }
+    }, [workflow, pendingAgentReplyAfterMessageId]);
 
     const handleReview = async (action: 'approve' | 'refine') => {
         if (submitting) return;
@@ -169,6 +250,7 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
             await axios.post(`${import.meta.env.VITE_API_URL}/api/workflows/${workflowId}/review`, {
                 action,
                 feedback: action === 'refine' ? feedback.trim() : undefined,
+                generation_options: action === 'approve' ? { verbosity: pptVerbosity } : undefined,
                 user_id: currentUser.id,
                 channel: 'web',
             });
@@ -188,11 +270,15 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
 
         setSendingMessage(true);
         try {
-            await axios.post(`${import.meta.env.VITE_API_URL}/api/workflows/${workflowId}/messages`, {
+            const res = await axios.post(`${import.meta.env.VITE_API_URL}/api/workflows/${workflowId}/messages`, {
                 user_id: currentUser.id,
                 message: chatInput.trim(),
                 channel: 'web'
             });
+            const postedMessageId = res.data?.chat_message?.id;
+            if (res.data?.agent_reply_started && typeof postedMessageId === 'number') {
+                setPendingAgentReplyAfterMessageId(postedMessageId);
+            }
             setChatInput('');
             fetchWorkflow();
         } catch (err: any) {
@@ -222,10 +308,15 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
 
     const handleStartResearch = async () => {
         if (triggeringResearch) return;
+        if (skipWebSearch && !hasDocumentOnlySource) {
+            alert('Upload at least one PDF or TXT document before using Skip web search.');
+            return;
+        }
         setTriggeringResearch(true);
         try {
             await axios.post(`${import.meta.env.VITE_API_URL}/api/workflows/${workflowId}/start-research`, {
-                user_id: currentUser.id
+                user_id: currentUser.id,
+                skip_web_search: skipWebSearch
             });
             fetchWorkflow();
         } catch (err: any) {
@@ -233,6 +324,53 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
             alert(err.response?.data?.error || 'Failed to start research');
         } finally {
             setTriggeringResearch(false);
+        }
+    };
+
+    const handleUploadAttachment = async () => {
+        if (uploadingAttachment || !selectedAttachmentFile) return;
+        setUploadingAttachment(true);
+        try {
+            const formData = new FormData();
+            formData.append('user_id', String(currentUser.id));
+            formData.append('file', selectedAttachmentFile);
+            await axios.post(`${import.meta.env.VITE_API_URL}/api/workflows/${workflowId}/attachments`, formData);
+            setSelectedAttachmentFile(null);
+            if (attachmentInputRef.current) {
+                attachmentInputRef.current.value = '';
+            }
+            fetchAttachments();
+            fetchWorkflow();
+        } catch (err: any) {
+            console.error('Failed to upload attachment:', err);
+            alert(err.response?.data?.error || 'Failed to upload document');
+        } finally {
+            setUploadingAttachment(false);
+        }
+    };
+
+    const handleUploadSubmissionDocument = async () => {
+        if (uploadingSubmissionDocument || !selectedSubmissionFile) return;
+        setUploadingSubmissionDocument(true);
+        try {
+            const formData = new FormData();
+            formData.append('user_id', String(currentUser.id));
+            formData.append('file', selectedSubmissionFile);
+            await axios.post(
+                `${import.meta.env.VITE_API_URL}/api/workflows/${workflowId}/submission-documents`,
+                formData
+            );
+            setSelectedSubmissionFile(null);
+            if (submissionInputRef.current) {
+                submissionInputRef.current.value = '';
+            }
+            fetchSubmissionDocuments();
+            fetchWorkflow();
+        } catch (err: any) {
+            console.error('Failed to upload submission document:', err);
+            alert(err.response?.data?.error || 'Failed to upload submission document');
+        } finally {
+            setUploadingSubmissionDocument(false);
         }
     };
 
@@ -311,32 +449,81 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
         );
     }
 
-    const orderedSteps = [...workflow.steps].sort((a, b) => a.step_order - b.step_order);
-    const pipelineSteps = orderedSteps.length > 0
-        ? orderedSteps.slice(0, 4).map((step) => {
-            const fallbackLabel = step.step_type.replace(/_/g, ' ');
-            const labelInfo = stepTypeLabels[step.step_type] || { label: fallbackLabel, icon: '📌' };
-            return {
-                key: `step-${step.id}`,
-                ...labelInfo,
-                step,
-            };
-        })
-        : [
-            { key: 'pending', label: 'Pending', icon: '⏳', step: null }
-        ];
+    const orderedSteps = [...workflow.steps].sort(
+        (a, b) => (a.step_order - b.step_order) || (a.id - b.id)
+    );
+    const originalRequestDescription = (() => {
+        // Prefer the earliest marketplace-linked step description when available.
+        for (const step of orderedSteps) {
+            const payload = step.input_data;
+            if (!payload || typeof payload !== 'object') continue;
+            const desc = typeof payload.description === 'string' ? payload.description.trim() : '';
+            if (!desc) continue;
+            const hasRequestId = payload.request_id !== undefined && payload.request_id !== null;
+            if (hasRequestId) return desc;
+        }
+        // Fallback for non-marketplace workflows that still carry a description.
+        for (const step of orderedSteps) {
+            const payload = step.input_data;
+            if (!payload || typeof payload !== 'object') continue;
+            const desc = typeof payload.description === 'string' ? payload.description.trim() : '';
+            if (desc) return desc;
+        }
+        return '';
+    })();
+    const latestStepByType = (stepType: string): WorkflowStep | null => {
+        const matches = orderedSteps.filter((step) => step.step_type === stepType);
+        return matches.length > 0 ? matches[matches.length - 1] : null;
+    };
 
-    const researchStep = workflow.steps.find(s => s.step_type === 'agent_research');
+    const researchStep = latestStepByType('agent_research');
     const researchOutput = researchStep?.output_data;
-    const generationStep = workflow.steps
-        .filter(s => s.step_type === 'agent_generation')
-        .slice(-1)[0];
+    const generationStep = latestStepByType('agent_generation');
     const generationError = generationStep?.output_data?.error as string | undefined;
+    const generationStatusMessage = generationStep?.output_data?.status_message as string | undefined;
+    const generationAttempt = generationStep?.output_data?.attempt as number | undefined;
+    const generationMaxAttempts = generationStep?.output_data?.max_attempts as number | undefined;
+    const sourceValidation = generationStep?.output_data?.source_url_validation as { ok?: boolean } | undefined;
+    const generationWarningNote = (
+        generationStep?.output_data?.warning_note as string | undefined
+    ) || (sourceValidation && sourceValidation.ok === false
+        ? 'The generated PPT may not have a dedicated sources slide.'
+        : undefined);
     const isGenerationFailed = generationStep?.status === 'failed';
 
-    const isAwaitingReview = workflow.status === 'awaiting_review';
+    const pipelineStageTypes = ['agent_collaboration', 'agent_research', 'human_review', 'agent_generation'];
+    const getPipelineStageStatus = (stepType: string, step: WorkflowStep | null): string => {
+        if (stepType === 'agent_research' && ['researching', 'refining'].includes(workflow.status)) {
+            return 'in_progress';
+        }
+        if (stepType === 'human_review' && workflow.status === 'awaiting_review') {
+            return 'awaiting_input';
+        }
+        if (stepType === 'agent_generation' && workflow.status === 'generating_ppt') {
+            return 'in_progress';
+        }
+        if (stepType === 'agent_generation' && ['researching', 'refining', 'awaiting_review'].includes(workflow.status)) {
+            return 'pending';
+        }
+        return step?.status || 'pending';
+    };
+    const pipelineSteps = pipelineStageTypes.map((stepType) => {
+        const step = latestStepByType(stepType);
+        const fallbackLabel = stepType.replace(/_/g, ' ');
+        const labelInfo = stepTypeLabels[stepType] || { label: fallbackLabel, icon: '📌' };
+        return {
+            key: `stage-${stepType}`,
+            ...labelInfo,
+            step,
+            status: getPipelineStageStatus(stepType, step),
+        };
+    });
+
     const isProcessing = ['researching', 'refining', 'generating_ppt', 'pending'].includes(workflow.status);
     const isActiveRun = ['researching', 'refining', 'generating_ppt'].includes(workflow.status);
+    const canApprove = workflow.status === 'awaiting_review';
+    const canRequestRefinement = ['awaiting_review', 'completed'].includes(workflow.status);
+    const isRefinementInputDisabled = submitting || isActiveRun || !canRequestRefinement;
     const hasAgentParticipant = workflow.steps.some(
         s => s.assignee?.is_agent || s.provider_type === 'agent'
     );
@@ -357,6 +544,21 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
         && hasAgentParticipant
         && currentUser.id === workflow.user_id
         && !isGenerationFailed;
+    const hasAnyAgentMessage = workflow.messages.some((msg) => msg.sender_type === 'agent');
+    const isWaitingForInitialKickoffReply = workflow.status === 'collaborating'
+        && hasAgentParticipant
+        && requiresResearch
+        && !hasAnyAgentMessage
+        && workflow.messages.some(
+            (msg) => msg.sender_type === 'system' && msg.message.includes('Research has not started yet.')
+        );
+    const isAgentResponding = pendingAgentReplyAfterMessageId !== null || isWaitingForInitialKickoffReply;
+    const agentRespondingCopy = isWaitingForInitialKickoffReply
+        ? 'OpenClaw is reviewing the request and drafting the kickoff confirmation...'
+        : 'OpenClaw is working on a response...';
+    const hasDocumentOnlySource = attachments.some((attachment) =>
+        documentOnlyResearchExtensions.has((attachment.extension || '').toLowerCase())
+    );
 
     const humanApprovals = workflow.approvals.filter(a => !a.user?.is_agent);
     const currentApproval = humanApprovals.find(a => a.user_id === currentUser.id);
@@ -381,14 +583,22 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                 </div>
             </div>
 
+            {originalRequestDescription && (
+                <div className="glass-card p-6 mb-6">
+                    <h3 className="text-white font-semibold mb-2">Request Description</h3>
+                    <p className="text-sm text-[var(--color-text-secondary)] whitespace-pre-wrap leading-relaxed">
+                        {originalRequestDescription}
+                    </p>
+                </div>
+            )}
+
             <div className="glass-card-static p-6 mb-6">
                 <div className="flex items-start justify-between">
                     {pipelineSteps.map((ps, idx) => {
-                        const step = ps.step;
-                        const status = step ? step.status : 'pending';
+                        const status = ps.status;
                         const dotClass = stepStatusToClass[status] || 'pipeline-dot-pending';
                         const isLast = idx === pipelineSteps.length - 1;
-                        const prevCompleted = idx > 0 && pipelineSteps[idx - 1].step?.status === 'completed';
+                        const prevCompleted = idx > 0 && pipelineSteps[idx - 1].status === 'completed';
 
                         return (
                             <div key={ps.key} className="pipeline-step">
@@ -522,6 +732,11 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                                     </p>
                                 </div>
                             </div>
+                            {generationWarningNote && (
+                                <p className="text-xs text-[var(--color-warning)] mt-3">
+                                    Note: {generationWarningNote}
+                                </p>
+                            )}
                         </div>
                     )}
 
@@ -530,8 +745,13 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                             <div className="w-12 h-12 border-2 border-purple-500 border-t-transparent rounded-full animate-spin-slow mx-auto mb-4" />
                             <h3 className="text-white font-semibold mb-2">Generating PowerPoint...</h3>
                             <p className="text-[var(--color-text-secondary)] text-sm">
-                                SlideSpeak is creating your presentation. This may take a few minutes.
+                                {generationStatusMessage || 'SlideSpeak is creating your presentation. This may take a few minutes.'}
                             </p>
+                            {generationAttempt && generationMaxAttempts && (
+                                <p className="text-xs text-[var(--color-text-muted)] mt-2">
+                                    Attempt {generationAttempt} of {generationMaxAttempts}
+                                </p>
+                            )}
                         </div>
                     )}
 
@@ -591,17 +811,35 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                         </div>
                     )}
 
-                    {isAwaitingReview && (
-                        <div className="glass-card p-6 border-purple-500/30" id="review-panel">
+                    <div
+                        className={`glass-card p-6 border-purple-500/30 ${isRefinementInputDisabled ? 'opacity-60' : ''}`}
+                        id="review-panel"
+                    >
                             <h3 className="text-white font-semibold mb-4 flex items-center gap-2">
                                 ⚡ Quality Gate — Your Review
                             </h3>
 
                             <div className="flex gap-3 mb-4">
+                                <div className="flex-1">
+                                    <label className="text-xs text-[var(--color-text-secondary)] font-medium mb-2 block">
+                                        PPT verbosity
+                                    </label>
+                                    <select
+                                        value={pptVerbosity}
+                                        onChange={(e) => setPptVerbosity(e.target.value as 'concise' | 'standard' | 'text-heavy')}
+                                        className="w-full bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-purple-500"
+                                        disabled={submitting || !canApprove}
+                                        id="ppt-verbosity-select"
+                                    >
+                                        <option value="concise">Concise</option>
+                                        <option value="standard">Standard</option>
+                                        <option value="text-heavy">Text-heavy</option>
+                                    </select>
+                                </div>
                                 <button
                                     onClick={() => handleReview('approve')}
-                                    disabled={submitting}
-                                    className="btn btn-success flex-1"
+                                    disabled={submitting || !canApprove}
+                                    className="btn btn-success flex-1 self-end"
                                     id="approve-btn"
                                 >
                                     {submitting ? 'Processing...' : '✅ Approve & Generate PPT'}
@@ -618,27 +856,36 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                                     placeholder="e.g., Please add more data about cost analysis and include recent statistics..."
                                     className="w-full bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg px-4 py-3 text-white text-sm placeholder:text-[var(--color-text-muted)] focus:outline-none focus:border-purple-500 resize-none"
                                     rows={3}
-                                    disabled={submitting}
+                                    disabled={isRefinementInputDisabled}
                                     id="feedback-input"
                                 />
                                 <button
                                     onClick={() => handleReview('refine')}
-                                    disabled={!feedback.trim() || submitting}
+                                    disabled={!feedback.trim() || isRefinementInputDisabled}
                                     className="btn btn-outline mt-2 w-full"
                                     id="refine-btn"
                                 >
-                                    {submitting ? 'Processing...' : '🔄 Request Refinement'}
+                                    {submitting ? 'Processing...' : isActiveRun ? '🔄 Refinement In Progress...' : '🔄 Request Refinement'}
                                 </button>
+                                {isActiveRun && (
+                                    <p className="text-xs text-[var(--color-text-muted)] mt-2">
+                                        Refinement controls unlock after the current run completes.
+                                    </p>
+                                )}
+                                {!isActiveRun && !canRequestRefinement && (
+                                    <p className="text-xs text-[var(--color-text-muted)] mt-2">
+                                        Refinement is available after research review and after PPT completion.
+                                    </p>
+                                )}
                             </div>
-                        </div>
-                    )}
+                    </div>
 
                     <div className="glass-card p-6" id="chat-panel">
                         <div className="flex items-center justify-between mb-4">
                             <h3 className="text-white font-semibold">💬 Collaboration Chat</h3>
                             {hasAgentParticipant && (
                                 <span className="text-[10px] text-emerald-400 uppercase tracking-wider">
-                                    OpenClaw enabled
+                                    {isAgentResponding ? 'OpenClaw responding...' : 'OpenClaw enabled'}
                                 </span>
                             )}
                         </div>
@@ -674,6 +921,20 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                                     );
                                 })
                             )}
+                            {isAgentResponding && (
+                                <div className="rounded-lg p-3 border bg-emerald-500/10 border-emerald-500/30 mr-8">
+                                    <div className="flex items-center justify-between mb-1">
+                                        <span className="text-xs font-semibold text-white">OpenClaw AI</span>
+                                        <span className="text-[10px] text-emerald-300 uppercase tracking-wider">
+                                            Responding
+                                        </span>
+                                    </div>
+                                    <div className="flex items-center gap-2 text-sm text-emerald-200">
+                                        <div className="w-3 h-3 border-2 border-emerald-400 border-t-transparent rounded-full animate-spin-slow" />
+                                        {agentRespondingCopy}
+                                    </div>
+                                </div>
+                            )}
                         </div>
 
                         <div className="mt-4 flex gap-2">
@@ -695,13 +956,36 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                         </div>
 
                         {canStartResearch && (
-                            <button
-                                onClick={handleStartResearch}
-                                disabled={triggeringResearch || workflow.status === 'generating_ppt'}
-                                className="btn btn-success mt-3 w-full"
-                            >
-                                {triggeringResearch ? 'Starting...' : 'Start Agent Research'}
-                            </button>
+                            <div className="mt-3">
+                                <label className="flex items-center gap-2 text-xs text-[var(--color-text-secondary)] mb-2">
+                                    <input
+                                        type="checkbox"
+                                        checked={skipWebSearch}
+                                        onChange={(event) => setSkipWebSearch(event.target.checked)}
+                                    />
+                                    Skip web search (use uploaded documents only)
+                                </label>
+                                {skipWebSearch && !hasDocumentOnlySource && (
+                                    <p className="text-xs text-[var(--color-warning)] mb-2">
+                                        Upload at least one PDF/TXT file to start document-only research.
+                                    </p>
+                                )}
+                                <button
+                                    onClick={handleStartResearch}
+                                    disabled={
+                                        triggeringResearch
+                                        || workflow.status === 'generating_ppt'
+                                        || (skipWebSearch && !hasDocumentOnlySource)
+                                    }
+                                    className="btn btn-success w-full"
+                                >
+                                    {triggeringResearch
+                                        ? 'Starting...'
+                                        : skipWebSearch
+                                            ? 'Start Agent Research (Documents Only)'
+                                            : 'Start Agent Research'}
+                                </button>
+                            </div>
                         )}
 
                     </div>
@@ -734,7 +1018,126 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                     )}
                 </div>
 
-                <div className="lg:col-span-1">
+                <div className="lg:col-span-1 space-y-4">
+                    <div className="glass-card p-5">
+                        <h3 className="text-white font-semibold mb-3 text-sm uppercase tracking-wider">
+                            Source Documents
+                        </h3>
+                        <p className="text-xs text-[var(--color-text-muted)] mb-3">
+                            Upload PDF, TXT, PPT, or PPTX files for collaborators.
+                            For document-only agent research, use PDF/TXT.
+                        </p>
+                        <div className="flex flex-col gap-2">
+                            <input
+                                ref={attachmentInputRef}
+                                type="file"
+                                accept=".pdf,.txt,.ppt,.pptx"
+                                onChange={(event) => {
+                                    const nextFile = event.target.files?.[0] || null;
+                                    setSelectedAttachmentFile(nextFile);
+                                }}
+                                className="text-xs text-[var(--color-text-secondary)]"
+                                disabled={uploadingAttachment}
+                            />
+                            <button
+                                onClick={handleUploadAttachment}
+                                disabled={!selectedAttachmentFile || uploadingAttachment}
+                                className="btn btn-outline text-xs px-3 py-2"
+                            >
+                                {uploadingAttachment ? 'Uploading...' : 'Upload'}
+                            </button>
+                        </div>
+
+                        <div className="mt-3 space-y-2 max-h-48 overflow-y-auto">
+                            {loadingAttachments ? (
+                                <p className="text-xs text-[var(--color-text-muted)]">Loading documents...</p>
+                            ) : attachments.length === 0 ? (
+                                <p className="text-xs text-[var(--color-text-muted)]">No documents uploaded yet.</p>
+                            ) : (
+                                attachments.map((attachment) => (
+                                    <div
+                                        key={attachment.filename}
+                                        className="flex items-center justify-between gap-3 text-xs"
+                                    >
+                                        <div className="min-w-0">
+                                            <p className="text-[var(--color-text-secondary)] truncate">
+                                                {attachment.display_name}
+                                            </p>
+                                            <p className="text-[10px] text-[var(--color-text-muted)]">
+                                                {attachment.size_formatted} · {formatDate(attachment.uploaded_at)}
+                                            </p>
+                                        </div>
+                                        <a
+                                            href={`${import.meta.env.VITE_API_URL}/api/workflows/${workflowId}/attachments/${encodeURIComponent(attachment.filename)}?user_id=${currentUser.id}`}
+                                            className="text-purple-300 hover:text-purple-200 whitespace-nowrap"
+                                        >
+                                            Download
+                                        </a>
+                                    </div>
+                                ))
+                            )}
+                        </div>
+                    </div>
+
+                    <div className="glass-card p-5">
+                        <h3 className="text-white font-semibold mb-3 text-sm uppercase tracking-wider">
+                            Submission Documents
+                        </h3>
+                        <p className="text-xs text-[var(--color-text-muted)] mb-3">
+                            Workers can upload their deliverables here (PDF, TXT, PPT, PPTX).
+                        </p>
+                        <div className="flex flex-col gap-2">
+                            <input
+                                ref={submissionInputRef}
+                                type="file"
+                                accept=".pdf,.txt,.ppt,.pptx"
+                                onChange={(event) => {
+                                    const nextFile = event.target.files?.[0] || null;
+                                    setSelectedSubmissionFile(nextFile);
+                                }}
+                                className="text-xs text-[var(--color-text-secondary)]"
+                                disabled={uploadingSubmissionDocument}
+                            />
+                            <button
+                                onClick={handleUploadSubmissionDocument}
+                                disabled={!selectedSubmissionFile || uploadingSubmissionDocument}
+                                className="btn btn-outline text-xs px-3 py-2"
+                            >
+                                {uploadingSubmissionDocument ? 'Uploading...' : 'Upload Submission'}
+                            </button>
+                        </div>
+
+                        <div className="mt-3 space-y-2 max-h-48 overflow-y-auto">
+                            {loadingSubmissionDocuments ? (
+                                <p className="text-xs text-[var(--color-text-muted)]">Loading submission documents...</p>
+                            ) : submissionDocuments.length === 0 ? (
+                                <p className="text-xs text-[var(--color-text-muted)]">No submission documents uploaded yet.</p>
+                            ) : (
+                                submissionDocuments.map((document) => (
+                                    <div
+                                        key={document.filename}
+                                        className="flex items-center justify-between gap-3 text-xs"
+                                    >
+                                        <div className="min-w-0">
+                                            <p className="text-[var(--color-text-secondary)] truncate">
+                                                {document.display_name}
+                                            </p>
+                                            <p className="text-[10px] text-[var(--color-text-muted)]">
+                                                {document.size_formatted} · {formatDate(document.uploaded_at)}
+                                            </p>
+                                        </div>
+                                        <a
+                                            href={`${import.meta.env.VITE_API_URL}/api/workflows/${workflowId}/submission-documents/${encodeURIComponent(document.filename)}?user_id=${currentUser.id}`}
+                                            className="text-purple-300 hover:text-purple-200 whitespace-nowrap"
+                                        >
+                                            Download
+                                        </a>
+                                    </div>
+                                ))
+                            )}
+                        </div>
+                    </div>
+
                     <div className="glass-card-static p-5 sticky top-6">
                         <h3 className="text-white font-semibold mb-4 text-sm uppercase tracking-wider">
                             Activity Timeline
