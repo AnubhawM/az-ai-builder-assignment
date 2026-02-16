@@ -1,46 +1,95 @@
-Web App Template
+# AIXplore Capability Exchange
 
-To run the application locally, follow these steps:
+## Overview
+AIXplore Capability Exchange is a collaborative workflow platform for AI-assisted research and presentation generation.
 
-First, clone your repository using "git clone (repository-url)" and navigate to the project folder using "cd (repository-folder)". 
+## Prerequisites
+- Python 3.12+
+- Conda (recommended)
+- Node.js + npm
+- OpenClaw installed locally
+- API keys configured in backend/frontend `.env` files
 
-For the backend, navigate to the backend folder using "cd backend". Create a Conda environment using "conda create --name (env-name) python=3.12.1 -y" and activate it with "conda activate (env-name)". 
+## 1. Clone The Repository
+```bash
+git clone https://github.com/AnubhawM/az-ai-builder-assignment.git
+cd az-ai-builder-assignment
+```
 
-Install dependencies using "pip install -r requirements.txt" from the "backend" directory. 
+## 2. Backend Setup
+From the project root:
 
-Fill out secrets in the provided .env.template file and rename it to .env. 
-.env files are in the .gitignore since they are not to be committed.
+```bash
+cd backend
+conda create --name <env-name> python=3.12.1 -y
+conda activate <env-name>
+pip install -r requirements.txt
+```
 
-Run the Flask server using python app.py. 
+Configure backend environment variables:
 
-If you are using GitHub Codespaces, make port 5000 public by opening the Ports tab in Codespaces, locating port 5000, and setting its visibility to Public. 
+```bash
+cp .env.template .env
+```
 
-For the frontend, navigate to the frontend folder using cd ../frontend. 
+Then fill in all required secrets in `backend/.env`.
 
-Install dependencies with npm install. 
+Run the backend:
 
-Fill out secrets in the provided .env.template file and rename it to .env. .env files are in the .gitignore since they are not to be committed. (Use the public URL provided by Codespaces for port 5000 if applicable). 
+```bash
+python app.py
+```
 
-Start the React development server with npm run dev. 
+## 3. Frontend Setup
+From the backend directory:
 
-If you are using GitHub Codespaces, make port 5173 public by opening the Ports tab, locating port 5173, and setting its visibility to Public. 
+```bash
+cd ../frontend
+npm install
+```
 
-Access the application by opening your browser and navigating to http://localhost:5173 (or use the public URL provided by Codespaces for port 5173). 
+Configure frontend environment variables:
 
-If you want to deploy this project for free, deploy your frontend using Vercel or Netlify and deploy your backend using Render or Railway. 
+```bash
+cp .env.template .env
+```
 
-You can set up Vercel deployment through Vercel's website or you can try from the terminal:
+Then fill in all required secrets in `frontend/.env`.
 
-For Vercel, navigate to your frontend directory and run vercel (after installing Vercel CLI with npm install -g vercel). 
+Run the frontend:
 
-Follow the prompts to deploy and get a public URL. Set environment variables for your backend URL in Vercel's project settings. 
+```bash
+npm run dev
+```
 
-For Render, create a new web service linked to your GitHub repository containing the backend code, set Python as the environment, and add any environment variables.
+## 4. OpenClaw Setup
+Install and onboard OpenClaw using the official repository:
 
-Deploy and get a public URL for your backend. Update your frontend's .env file with this backend URL and redeploy your frontend. 
+https://github.com/openclaw/openclaw
 
-After deployment, test your application by accessing it via the frontend's public URL. 
+During onboarding:
+- Select a supported model provider and configure API keys.
+- Enable Brave web search and provide a Brave API key (Between the free plans, select Free AI plan - it allows agentic web search).
 
-If you encounter issues during deployment or testing, ensure that both frontend and backend URLs are correctly configured in their respective .env files and that CORS is properly handled in your backend code. Ensure that the correct URLs are being used in app.py and any axios calls (for example, make sure that you switch from localhost URLs to public URLs)
+If you need to change OpenClaw configuration later:
 
-Mind the URLs in app.py and App.tsx. Depending on if you are doing local development or using URLs from the deployments, you need to change them in the code to avoid CORS issues. Add the URLs as an environment variable eventually so it's not hardcoded in the files.
+```bash
+openclaw configure
+```
+
+Start OpenClaw gateway:
+
+```bash
+openclaw gateway run
+```
+
+Open the dashboard:
+
+http://localhost:18789/overview
+
+## 5. Run The Full App
+Once backend, frontend, and OpenClaw are running, the platform is ready to use.
+
+## Notes
+- `.env` files are ignored by git and should never be committed.
+- If any service fails to start, verify `.env` values and API keys first.

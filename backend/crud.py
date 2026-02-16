@@ -110,6 +110,26 @@ def update_workflow_status(db: Session, workflow_id: int, status: str,
     return workflow
 
 
+def delete_workflow(db: Session, workflow: Workflow) -> None:
+    """
+    Delete a workflow and related records.
+    Any linked child workflows/work requests are detached first to satisfy FK constraints.
+    """
+    # Detach self-referencing child workflows.
+    for child in workflow.sub_workflows:
+        child.parent_id = None
+
+    # Detach marketplace requests that reference this workflow as a parent.
+    (
+        db.query(WorkRequest)
+        .filter(WorkRequest.parent_workflow_id == workflow.id)
+        .update({"parent_workflow_id": None}, synchronize_session=False)
+    )
+
+    db.delete(workflow)
+    db.commit()
+
+
 # ──────────────────────────────────────
 # WorkflowStep Operations
 # ──────────────────────────────────────
@@ -341,6 +361,24 @@ def get_open_work_requests(db: Session) -> list[WorkRequest]:
         db.query(WorkRequest)
         .filter(WorkRequest.status == "open")
         .order_by(WorkRequest.created_at.desc())
+        .all()
+    )
+
+
+def get_pending_invites_for_user(db: Session, user_id: int) -> list[Volunteer]:
+    """
+    Get open marketplace requests where this user has a pending invite.
+    """
+    return (
+        db.query(Volunteer)
+        .join(WorkRequest, Volunteer.request_id == WorkRequest.id)
+        .filter(
+            Volunteer.user_id == user_id,
+            Volunteer.status == "pending",
+            WorkRequest.status == "open",
+            Volunteer.note.like("Direct invite%")
+        )
+        .order_by(Volunteer.created_at.desc())
         .all()
     )
 

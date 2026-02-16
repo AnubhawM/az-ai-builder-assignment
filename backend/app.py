@@ -25,7 +25,7 @@ os.makedirs(PPT_OUTPUT_DIR, exist_ok=True)
 CORS(app, 
     origins=["http://localhost:5173", "http://localhost:5174"],
     allow_headers=["Content-Type"],
-    methods=["GET", "POST", "OPTIONS"])
+    methods=["GET", "POST", "DELETE", "OPTIONS"])
 
 # Register the workflow API blueprint
 app.register_blueprint(workflow_bp)
@@ -36,7 +36,7 @@ def add_cors_headers(response):
     origin = request.headers.get('Origin')
     if origin in ["http://localhost:5173", "http://localhost:5174"]:
         response.headers['Access-Control-Allow-Origin'] = origin
-    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS'
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
     return response
 

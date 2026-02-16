@@ -30,6 +30,13 @@ interface WorkRequest {
     created_at: string;
     requester: { name: string; role: string };
     volunteers: Volunteer[];
+    attachments?: Array<{
+        filename: string;
+        display_name: string;
+        extension: string;
+        size_formatted: string;
+        uploaded_at: string;
+    }>;
 }
 
 interface MarketplaceDetailProps {
@@ -104,7 +111,20 @@ const MarketplaceDetail: React.FC<MarketplaceDetailProps> = ({ requestId, curren
     if (!request) return null;
 
     const isRequester = currentUser.id === request.requester_id;
-    const hasVolunteered = request.volunteers.some(v => v.user_id === currentUser.id);
+    const isDirectInvite = (note: string) => (note || '').startsWith('Direct invite');
+    const invitedPersonas = request.volunteers.filter((v) => isDirectInvite(v.note));
+    const visibleVolunteers = request.volunteers.filter(
+        (v) => !(v.status === 'pending' && isDirectInvite(v.note))
+    );
+    const pendingDirectInviteCount = request.volunteers.filter(
+        (v) => v.status === 'pending' && isDirectInvite(v.note)
+    ).length;
+    const myInvite = request.volunteers.find(
+        (v) => v.user_id === currentUser.id && v.status === 'pending' && isDirectInvite(v.note)
+    );
+    const hasVolunteered = request.volunteers.some(
+        (v) => v.user_id === currentUser.id && !isDirectInvite(v.note)
+    );
 
     return (
         <div className="max-w-4xl mx-auto px-6 py-8">
@@ -141,7 +161,7 @@ const MarketplaceDetail: React.FC<MarketplaceDetailProps> = ({ requestId, curren
                         </div>
 
                         <div className="mt-8">
-                            <h4 className="text-white text-sm uppercase tracking-widest mb-3 font-semibold">Required Capabilities</h4>
+                            <h4 className="text-white text-sm uppercase tracking-widest mb-3 font-semibold">Tags</h4>
                             <div className="flex flex-wrap gap-2">
                                 {request.required_capabilities.map((cap, i) => (
                                     <span key={i} className="bg-[var(--color-surface)] border border-[var(--color-border)] px-3 py-1 rounded text-xs text-purple-300">
@@ -150,20 +170,49 @@ const MarketplaceDetail: React.FC<MarketplaceDetailProps> = ({ requestId, curren
                                 ))}
                             </div>
                         </div>
+
+                        {request.attachments && request.attachments.length > 0 && (
+                            <div className="mt-8">
+                                <h4 className="text-white text-sm uppercase tracking-widest mb-3 font-semibold">Supporting Files</h4>
+                                <div className="space-y-2">
+                                    {request.attachments.map((file) => (
+                                        <div
+                                            key={file.filename}
+                                            className="flex items-center justify-between gap-3 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg px-3 py-2"
+                                        >
+                                            <div className="min-w-0">
+                                                <p className="text-sm text-white truncate">{file.display_name}</p>
+                                                <p className="text-[10px] text-[var(--color-text-muted)]">
+                                                    {file.size_formatted}
+                                                </p>
+                                            </div>
+                                            <a
+                                                href={`${import.meta.env.VITE_API_URL}/api/marketplace/${request.id}/attachments/${encodeURIComponent(file.filename)}`}
+                                                className="text-xs text-purple-300 hover:text-purple-200 whitespace-nowrap"
+                                            >
+                                                Download
+                                            </a>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
                     </div>
 
                     {/* Volunteers List */}
                     <div>
                         <h3 className="text-xl font-bold text-white mb-4 flex items-center gap-3">
-                            Volunteers ({request.volunteers.length})
+                            Volunteers ({visibleVolunteers.length})
                         </h3>
                         <div className="space-y-4">
-                            {request.volunteers.length === 0 ? (
+                            {visibleVolunteers.length === 0 ? (
                                 <div className="glass-card-static p-8 text-center text-[var(--color-text-muted)] italic">
-                                    Awaiting volunteers...
+                                    {pendingDirectInviteCount > 0
+                                        ? `Awaiting invite acceptance (${pendingDirectInviteCount} pending)...`
+                                        : 'Awaiting volunteers...'}
                                 </div>
                             ) : (
-                                request.volunteers.map((v) => (
+                                visibleVolunteers.map((v) => (
                                     <div key={v.id} className={`glass-card p-6 flex items-start gap-4 ${v.status === 'accepted' ? 'border-emerald-500/50' : ''}`}>
                                         <div className={`w-12 h-12 rounded-full flex-shrink-0 flex items-center justify-center text-lg font-bold text-white ${v.user.is_agent ? 'bg-emerald-600 shadow-[0_0_15px_rgba(16,185,129,0.3)]' : 'bg-purple-600'}`}>
                                             {v.user.is_agent ? '🤖' : v.user.name.charAt(0)}
@@ -206,7 +255,64 @@ const MarketplaceDetail: React.FC<MarketplaceDetailProps> = ({ requestId, curren
 
                 {/* Sidebar Actions */}
                 <div className="space-y-6">
-                    {!isRequester && request.status === 'open' && !hasVolunteered && (
+                    {isRequester && (
+                        <div className="glass-card p-6 border-cyan-500/30">
+                            <h4 className="text-white font-bold mb-3 uppercase text-xs tracking-widest">Invited Personas</h4>
+                            {invitedPersonas.length === 0 ? (
+                                <p className="text-xs text-[var(--color-text-muted)]">
+                                    No direct invites sent for this request.
+                                </p>
+                            ) : (
+                                <div className="space-y-3">
+                                    {invitedPersonas.map((invite) => {
+                                        const statusTone = invite.status === 'accepted'
+                                            ? 'text-emerald-300 border-emerald-500/30 bg-emerald-500/10'
+                                            : invite.status === 'rejected'
+                                                ? 'text-red-300 border-red-500/30 bg-red-500/10'
+                                                : 'text-amber-300 border-amber-500/30 bg-amber-500/10';
+                                        return (
+                                            <div key={invite.id} className="flex items-center justify-between gap-3 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg px-3 py-2">
+                                                <div className="min-w-0">
+                                                    <p className="text-sm text-white truncate inline-flex items-center gap-2">
+                                                        {invite.user.name}
+                                                        {invite.user.is_agent && (
+                                                            <span className="text-[10px] bg-emerald-500/20 text-emerald-400 px-1.5 py-0.5 rounded border border-emerald-500/20">
+                                                                AGENT
+                                                            </span>
+                                                        )}
+                                                    </p>
+                                                    <p className="text-[10px] text-[var(--color-text-muted)] uppercase">
+                                                        {invite.user.role.replace('_', ' ')}
+                                                    </p>
+                                                </div>
+                                                <span className={`text-[10px] font-semibold uppercase tracking-wider px-2 py-1 rounded border ${statusTone}`}>
+                                                    {invite.status}
+                                                </span>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            )}
+                        </div>
+                    )}
+
+                    {!isRequester && request.status === 'open' && !!myInvite && (
+                        <div className="glass-card p-6 border-emerald-500/30">
+                            <h4 className="text-white font-bold mb-3 uppercase text-xs tracking-widest">Direct Invite</h4>
+                            <p className="text-sm text-[var(--color-text-secondary)] mb-4">
+                                You were invited by the requester to collaborate on this need.
+                            </p>
+                            <button
+                                onClick={() => handleAccept(myInvite.id)}
+                                disabled={accepting !== null}
+                                className="btn btn-primary w-full"
+                            >
+                                {accepting === myInvite.id ? 'Starting...' : 'Accept & Start'}
+                            </button>
+                        </div>
+                    )}
+
+                    {!isRequester && request.status === 'open' && !hasVolunteered && !myInvite && (
                         <div className="glass-card p-6 border-purple-500/30">
                             <h4 className="text-white font-bold mb-3 uppercase text-xs tracking-widest">Your Proposal</h4>
                             <textarea
@@ -248,7 +354,7 @@ const MarketplaceDetail: React.FC<MarketplaceDetailProps> = ({ requestId, curren
                             </div>
                             <div>
                                 <p className="text-[10px] text-[var(--color-text-muted)] uppercase">Matches</p>
-                                <p className="text-sm font-medium text-white">{request.volunteers.length} volunteer(s)</p>
+                                <p className="text-sm font-medium text-white">{visibleVolunteers.length} volunteer(s)</p>
                             </div>
                             <div>
                                 <p className="text-[10px] text-[var(--color-text-muted)] uppercase">Type</p>
