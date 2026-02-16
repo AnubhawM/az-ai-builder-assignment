@@ -54,6 +54,7 @@ const statusConfig: Record<string, { label: string; badge: string; icon: string 
 };
 
 const runningWorkflowStatuses = new Set(['researching', 'refining', 'generating_ppt']);
+const CENTRAL_TIME_ZONE = 'America/Chicago';
 
 const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSelectWorkflow, onSelectRequest }) => {
     const [workflows, setWorkflows] = useState<WorkflowSummary[]>([]);
@@ -160,7 +161,11 @@ const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSe
         if (!dateStr) return '';
         const d = new Date(dateStr);
         return d.toLocaleDateString('en-US', {
-            month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
+            month: 'short',
+            day: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit',
+            timeZone: CENTRAL_TIME_ZONE,
         });
     };
 

@@ -27,6 +27,8 @@ interface StatusCheckResult {
     output_directory: string;
 }
 
+const CENTRAL_TIME_ZONE = 'America/Chicago';
+
 // Helper function to format relative time
 const getTimeAgo = (date: Date): string => {
     const now = new Date();
@@ -40,7 +42,7 @@ const getTimeAgo = (date: Date): string => {
     if (diffMin < 60) return `${diffMin} minute${diffMin > 1 ? 's' : ''} ago`;
     if (diffHour < 24) return `${diffHour} hour${diffHour > 1 ? 's' : ''} ago`;
     if (diffDay < 7) return `${diffDay} day${diffDay > 1 ? 's' : ''} ago`;
-    return date.toLocaleDateString();
+    return date.toLocaleDateString('en-US', { timeZone: CENTRAL_TIME_ZONE });
 };
 
 

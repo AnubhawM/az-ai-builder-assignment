@@ -46,6 +46,8 @@ interface MarketplaceDetailProps {
     onStartWorkflow: (workflowId: number) => void;
 }
 
+const CENTRAL_TIME_ZONE = 'America/Chicago';
+
 const MarketplaceDetail: React.FC<MarketplaceDetailProps> = ({ requestId, currentUser, onBack, onStartWorkflow }) => {
     const [request, setRequest] = useState<WorkRequest | null>(null);
     const [loading, setLoading] = useState(true);
@@ -150,7 +152,7 @@ const MarketplaceDetail: React.FC<MarketplaceDetailProps> = ({ requestId, curren
                                 <span>{request.requester.name}</span>
                             </div>
                             <span>•</span>
-                            <span>{new Date(request.created_at).toLocaleDateString()}</span>
+                            <span>{new Date(request.created_at).toLocaleDateString('en-US', { timeZone: CENTRAL_TIME_ZONE })}</span>
                         </div>
 
                         <div className="prose prose-invert max-w-none">
@@ -224,7 +226,11 @@ const MarketplaceDetail: React.FC<MarketplaceDetailProps> = ({ requestId, curren
                                                     {v.user.is_agent && <span className="text-[10px] bg-emerald-500/20 text-emerald-400 px-2 py-0.5 rounded border border-emerald-500/20">AGENT</span>}
                                                 </h4>
                                                 <span className="text-[10px] text-[var(--color-text-muted)] uppercase tracking-wider">
-                                                    {new Date(v.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                                    {new Date(v.created_at).toLocaleTimeString('en-US', {
+                                                        hour: '2-digit',
+                                                        minute: '2-digit',
+                                                        timeZone: CENTRAL_TIME_ZONE,
+                                                    })}
                                                 </span>
                                             </div>
                                             <p className="text-xs text-purple-400 mb-2 uppercase tracking-tight">{v.user.role.replace('_', ' ')}</p>

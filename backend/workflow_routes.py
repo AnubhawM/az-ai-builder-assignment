@@ -2,25 +2,25 @@
 Workflow API Routes — Flask Blueprint for the AIXplore Capability Exchange.
 
 Endpoints:
-    GET  /api/users                  — List all personas
-    POST /api/workflows              — Create a new workflow (triggers research)
-    GET  /api/workflows              — List workflows (filtered by user/role)
-    GET  /api/workflows/<id>         — Get full workflow detail
-    GET  /api/workflows/<id>/attachments — List uploaded workflow attachments
-    POST /api/workflows/<id>/attachments — Upload workflow attachment (.pdf/.txt/.ppt/.pptx)
-    GET  /api/workflows/<id>/attachments/<filename> — Download workflow attachment
-    GET  /api/workflows/<id>/submission-documents — List uploaded submission documents
-    POST /api/workflows/<id>/submission-documents — Upload submission document (.pdf/.txt/.ppt/.pptx)
-    GET  /api/workflows/<id>/submission-documents/<filename> — Download submission document
-    DELETE /api/workflows/<id>       — Delete a workflow owned by the requester
-    POST /api/workflows/<id>/review  — Submit approve/refine action
-    GET  /api/workflows/<id>/messages — List workflow chat messages
-    POST /api/workflows/<id>/messages — Post workflow chat message
-    POST /api/workflows/<id>/completion — Mark/reopen collaborative completion
-    POST /api/workflows/<id>/generate-ppt — Trigger PPT from chat context
-    POST /api/workflows/<id>/cancel-run — Cancel an active run
-    POST /api/workflows/<id>/retry-run — Retry a failed/stalled run
-    POST /api/slack/interactions     — Handle inbound Slack button clicks
+    GET  /api/users                                             — List all personas
+    POST /api/workflows                                         — Create a new workflow (triggers research)
+    GET  /api/workflows                                         — List workflows (filtered by user/role)
+    GET  /api/workflows/<id>                                    — Get full workflow detail
+    GET  /api/workflows/<id>/attachments                        — List uploaded workflow attachments
+    POST /api/workflows/<id>/attachments                        — Upload workflow attachment (.pdf/.txt/.ppt/.pptx)
+    GET  /api/workflows/<id>/attachments/<filename>             — Download workflow attachment
+    GET  /api/workflows/<id>/submission-documents               — List uploaded submission documents
+    POST /api/workflows/<id>/submission-documents               — Upload submission document (.pdf/.txt/.ppt/.pptx)
+    GET  /api/workflows/<id>/submission-documents/<filename>    — Download submission document
+    DELETE /api/workflows/<id>                                  — Delete a workflow owned by the requester
+    POST /api/workflows/<id>/review                             — Submit approve/refine action
+    GET  /api/workflows/<id>/messages                           — List workflow chat messages
+    POST /api/workflows/<id>/messages                           — Post workflow chat message
+    POST /api/workflows/<id>/completion                         — Mark/reopen collaborative completion
+    POST /api/workflows/<id>/generate-ppt                       — Trigger PPT from chat context
+    POST /api/workflows/<id>/cancel-run                         — Cancel an active run
+    POST /api/workflows/<id>/retry-run                          — Retry a failed/stalled run
+    POST /api/slack/interactions                                — Handle inbound Slack button clicks
 """
 
 import os

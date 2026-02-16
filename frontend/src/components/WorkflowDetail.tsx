@@ -134,6 +134,7 @@ const workflowStatusLabel: Record<string, string> = {
 };
 
 const documentOnlyResearchExtensions = new Set(['.pdf', '.txt']);
+const CENTRAL_TIME_ZONE = 'America/Chicago';
 
 const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser, onBack }) => {
     const [workflow, setWorkflow] = useState<Workflow | null>(null);
@@ -429,13 +430,23 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
     const formatTime = (dateStr: string) => {
         if (!dateStr) return '';
         const d = new Date(dateStr);
-        return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+        return d.toLocaleTimeString('en-US', {
+            hour: '2-digit',
+            minute: '2-digit',
+            timeZone: CENTRAL_TIME_ZONE,
+        });
     };
 
     const formatDate = (dateStr: string) => {
         if (!dateStr) return '';
         const d = new Date(dateStr);
-        return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+        return d.toLocaleDateString('en-US', {
+            month: 'short',
+            day: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit',
+            timeZone: CENTRAL_TIME_ZONE,
+        });
     };
 
     if (loading || !workflow) {

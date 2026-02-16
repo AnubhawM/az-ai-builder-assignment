@@ -58,6 +58,7 @@ const CAPABILITY_OPTIONS = [
 
 const isPendingDirectInvite = (volunteer: Volunteer) =>
     volunteer.status === 'pending' && (volunteer.note || '').startsWith('Direct invite');
+const CENTRAL_TIME_ZONE = 'America/Chicago';
 
 const Marketplace: React.FC<MarketplaceProps> = ({ currentUser, onSelectRequest }) => {
     const [requests, setRequests] = useState<WorkRequest[]>([]);
@@ -140,7 +141,11 @@ const Marketplace: React.FC<MarketplaceProps> = ({ currentUser, onSelectRequest 
         if (!dateStr) return '';
         const d = new Date(dateStr);
         return d.toLocaleDateString('en-US', {
-            month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
+            month: 'short',
+            day: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit',
+            timeZone: CENTRAL_TIME_ZONE,
         });
     };
 
