@@ -103,7 +103,10 @@ def _ensure_sources_slide_in_outline(slide_outline: str, source_text: str) -> st
         urls = _extract_unique_urls(source_text or "", limit=5)
 
     if urls:
-        bullets = [f"- {url}" for url in urls[:6]]
+        bullets = [
+            f"- {_source_identifier_from_url(url, idx)} - {url}"
+            for idx, url in enumerate(urls[:6], start=1)
+        ]
     else:
         bullets = [
             "- No explicit source URLs were detected in this research output. "
@@ -210,7 +213,12 @@ def parse_research_output(raw_text: str) -> dict:
 # Research Pipeline
 # ──────────────────────────────────────
 
-def _build_research_prompt(topic: str, num_slides: int = 8, request_description: str = "") -> str:
+def _build_research_prompt(
+    topic: str,
+    num_slides: int = 8,
+    request_description: str = "",
+    use_web_search: bool = True
+) -> str:
     """Build the structured research prompt for OpenClaw."""
     description_block = ""
     if request_description and request_description.strip():
@@ -220,6 +228,54 @@ ADDITIONAL REQUEST CONTEXT:
 
 Use both the topic and this context when selecting what to research, which facts to prioritize, and how to structure the final slides.
 """
+
+    if not use_web_search:
+        return f"""You are a research assistant for the AIXplore Capability Exchange.
+
+TASK: Analyze the following topic using ONLY the provided source material: "{topic}"
+{description_block}
+
+CRITICAL RULES:
+- Do NOT perform web_search.
+- Do NOT introduce external sources that are not present in the provided documents/context.
+- Ground claims in the provided material.
+
+After completing your analysis, return your findings in this EXACT format (use the section headers exactly as shown):
+
+=== EXECUTIVE SUMMARY ===
+Write a 2-3 paragraph executive summary based only on the provided documents/context.
+
+=== SLIDE OUTLINE ===
+Create a {num_slides}-slide presentation outline. For each slide, provide:
+Slide 1: [Title]
+- [Content-rich bullet 1: full sentence with concrete detail]
+- [Content-rich bullet 2: full sentence with concrete detail]
+- [Content-rich bullet 3: full sentence with concrete detail]
+- [Content-rich bullet 4: full sentence with concrete detail]
+- [Content-rich bullet 5: full sentence with concrete detail]
+
+Slide 2: [Title]
+- [Content-rich bullet 1: full sentence with concrete detail]
+- [Content-rich bullet 2: full sentence with concrete detail]
+- [Content-rich bullet 3: full sentence with concrete detail]
+- [Content-rich bullet 4: full sentence with concrete detail]
+- [Content-rich bullet 5: full sentence with concrete detail]
+
+(Continue for all {num_slides} slides)
+IMPORTANT: The final slide must be titled exactly "Sources and Further Reading".
+Use document names and explicit URLs only if URLs appear in the provided material.
+
+=== RAW RESEARCH ===
+Include all key extracted facts, evidence, and detailed notes from the provided documents/context.
+
+QUALITY REQUIREMENTS:
+- Each slide must have at least 5 substantial bullets.
+- Bullets should be 12-28 words each, not fragments.
+- Include specific names, dates, figures, and examples where available.
+- Avoid generic filler statements.
+- If source URLs are unavailable in the material, state that clearly on the sources slide.
+
+IMPORTANT: Use only the provided source material and return the response in the exact format above."""
 
     return f"""You are a research assistant for the AIXplore Capability Exchange.
 
@@ -301,7 +357,8 @@ def start_research(
     topic: str,
     openclaw_session_id: str,
     request_description: str = "",
-    research_step_id: int | None = None
+    research_step_id: int | None = None,
+    use_web_search: bool = True
 ):
     """
     Launch a background thread to run OpenClaw research.
@@ -309,7 +366,7 @@ def start_research(
     """
     thread = threading.Thread(
         target=_run_research_thread,
-        args=(workflow_id, topic, openclaw_session_id, request_description, research_step_id),
+        args=(workflow_id, topic, openclaw_session_id, request_description, research_step_id, use_web_search),
         daemon=True
     )
     thread.start()
@@ -321,7 +378,8 @@ def _run_research_thread(
     topic: str,
     openclaw_session_id: str,
     request_description: str = "",
-    research_step_id: int | None = None
+    research_step_id: int | None = None,
+    use_web_search: bool = True
 ):
     """Background thread: executes OpenClaw research and updates DB."""
     db = SessionLocal()
@@ -354,7 +412,11 @@ def _run_research_thread(
         )
 
         # Build prompt and call OpenClaw (synchronous — blocks this thread)
-        prompt = _build_research_prompt(topic, request_description=request_description)
+        prompt = _build_research_prompt(
+            topic,
+            request_description=request_description,
+            use_web_search=use_web_search
+        )
         print(f"[Workflow {workflow_id}] Starting OpenClaw research...")
 
         result = ask_openclaw(
@@ -892,6 +954,36 @@ def _extract_unique_urls(text: str, limit: int = 12) -> list[str]:
     return urls
 
 
+def _source_identifier_from_url(url: str, index: int) -> str:
+    parsed = urlparse((url or "").strip())
+    host = (parsed.netloc or "").strip().lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host:
+        return host
+    return f"source-{index}"
+
+
+def _extract_source_urls_for_slide(source_text: str, limit: int = 12) -> list[str]:
+    # Prefer true citation hosts, then fall back to any URL if needed.
+    all_urls = _extract_unique_urls(source_text or "", limit=limit * 3)
+    citation_urls = [url for url in all_urls if _is_citation_url(url)]
+    if citation_urls:
+        return citation_urls[:limit]
+    return all_urls[:limit]
+
+
+def _format_sources_bullets(source_urls: list[str], limit: int = 12) -> list[str]:
+    urls = _extract_unique_urls("\n".join(source_urls or []), limit=limit)
+    bullets = [
+        f"{_source_identifier_from_url(url, idx)} - {url}"
+        for idx, url in enumerate(urls, start=1)
+    ]
+    if bullets:
+        return bullets
+    return ["No explicit source URLs were detected in this research output."]
+
+
 def _is_citation_url(url: str) -> bool:
     parsed = urlparse((url or "").strip())
     if parsed.scheme.lower() not in {"http", "https"}:
@@ -902,6 +994,67 @@ def _is_citation_url(url: str) -> bool:
     if host in NON_CITATION_URL_HOSTS:
         return False
     return True
+
+
+def _append_forced_sources_slide(pptx_path: str, source_urls: list[str]) -> None:
+    try:
+        from pptx import Presentation
+        from pptx.enum.shapes import PP_PLACEHOLDER
+        from pptx.util import Inches
+    except Exception as exc:
+        raise RuntimeError(
+            "python-pptx is required to enforce a guaranteed sources slide."
+        ) from exc
+
+    presentation = Presentation(pptx_path)
+    layout = None
+    for candidate in presentation.slide_layouts:
+        has_title = False
+        has_body = False
+        for placeholder in candidate.placeholders:
+            placeholder_type = placeholder.placeholder_format.type
+            if placeholder_type == PP_PLACEHOLDER.TITLE:
+                has_title = True
+            if placeholder_type in {PP_PLACEHOLDER.BODY, PP_PLACEHOLDER.OBJECT}:
+                has_body = True
+        if has_title and has_body:
+            layout = candidate
+            break
+
+    if layout is None:
+        layout = presentation.slide_layouts[1] if len(presentation.slide_layouts) > 1 else presentation.slide_layouts[0]
+
+    slide = presentation.slides.add_slide(layout)
+
+    if slide.shapes.title:
+        slide.shapes.title.text = "Sources and Further Reading"
+    else:
+        title_box = slide.shapes.add_textbox(Inches(0.8), Inches(0.4), Inches(12.0), Inches(0.8))
+        title_box.text_frame.text = "Sources and Further Reading"
+
+    text_frame = None
+    for shape in slide.shapes:
+        if not getattr(shape, "is_placeholder", False):
+            continue
+        if not shape.has_text_frame:
+            continue
+        placeholder_type = shape.placeholder_format.type
+        if placeholder_type in {PP_PLACEHOLDER.BODY, PP_PLACEHOLDER.OBJECT}:
+            text_frame = shape.text_frame
+            break
+
+    if text_frame is None:
+        body_box = slide.shapes.add_textbox(Inches(0.8), Inches(1.5), Inches(11.7), Inches(5.2))
+        text_frame = body_box.text_frame
+
+    bullets = _format_sources_bullets(source_urls, limit=12)
+    text_frame.clear()
+    for idx, bullet in enumerate(bullets):
+        paragraph = text_frame.paragraphs[0] if idx == 0 else text_frame.add_paragraph()
+        paragraph.text = bullet
+        paragraph.level = 0
+
+    presentation.save(pptx_path)
 
 
 def _validate_sources_slide_has_urls(pptx_path: str) -> dict:
@@ -1165,10 +1318,11 @@ def _generate_ppt_via_slidespeak(
         f"Research, outline, and refinement context:\n{research_context}"
     )
     if force_sources_urls:
-        url_list = "\n".join(f"- {url}" for url in force_sources_urls[:12])
+        url_bullets = _format_sources_bullets(force_sources_urls, limit=12)
+        url_list = "\n".join(f"- {entry}" for entry in url_bullets)
         generation_prompt += (
             "\n\nMANDATORY FINAL SLIDE URL LIST (COPY EXACTLY):\n"
-            "Use these URLs verbatim on the final sources slide.\n"
+            "Use these source bullets verbatim on the final sources slide in 'identifier - URL' format.\n"
             f"{url_list}"
         )
     if strict_sources_retry:
@@ -1332,7 +1486,7 @@ def _run_ppt_generation_thread(
             }
         )
 
-        source_urls = _extract_unique_urls(research_text, limit=12)
+        source_urls = _extract_source_urls_for_slide(research_text, limit=12)
         ppt_result = _generate_ppt_via_slidespeak(
             presentation_focus=presentation_focus,
             research_text=research_text,
@@ -1380,15 +1534,32 @@ def _run_ppt_generation_thread(
                 except OSError:
                     pass
             if not source_validation.get("ok"):
-                raise RuntimeError(
-                    "Generated PPT is missing explicit source URLs on the final slide after one automatic retry. "
-                    f"{source_validation.get('reason', '')}".strip()
+                create_event(
+                    db, workflow_id=workflow_id, event_type="generation_retry_failed",
+                    actor_type="system", step_id=gen_step.id,
+                    message=(
+                        "Retry still failed sources validation. "
+                        "Applying deterministic sources-slide post-processing."
+                    )
                 )
-            create_event(
-                db, workflow_id=workflow_id, event_type="generation_retry_succeeded",
-                actor_type="system", step_id=gen_step.id,
-                message="Auto-retry succeeded with explicit source URLs on the final slide."
-            )
+                _append_forced_sources_slide(ppt_result["file_path"], source_urls)
+                source_validation = _validate_sources_slide_has_urls(ppt_result["file_path"])
+                if not source_validation.get("ok"):
+                    raise RuntimeError(
+                        "Could not enforce final sources slide with explicit URLs after retry and post-processing: "
+                        f"{source_validation.get('reason', 'unknown validation error')}"
+                    )
+                create_event(
+                    db, workflow_id=workflow_id, event_type="generation_sources_enforced",
+                    actor_type="system", step_id=gen_step.id,
+                    message="A deterministic sources slide was appended successfully."
+                )
+            else:
+                create_event(
+                    db, workflow_id=workflow_id, event_type="generation_retry_succeeded",
+                    actor_type="system", step_id=gen_step.id,
+                    message="Auto-retry succeeded with explicit source URLs on the final slide."
+                )
         ppt_result["source_url_validation"] = {
             "retry_attempted": retried_for_sources,
             **source_validation

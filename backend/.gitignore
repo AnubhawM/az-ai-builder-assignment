@@ -9,6 +9,7 @@ __pycache__/
 .env
 
 temp_uploads
+uploads/
 
 # SQLite database
 *.db

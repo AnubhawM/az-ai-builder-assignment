@@ -1,5 +1,5 @@
 // src/components/Marketplace.tsx
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import axios from 'axios';
 import { toast } from 'react-toastify';
 
@@ -56,6 +56,9 @@ const CAPABILITY_OPTIONS = [
     'risk',
 ] as const;
 
+const isPendingDirectInvite = (volunteer: Volunteer) =>
+    volunteer.status === 'pending' && (volunteer.note || '').startsWith('Direct invite');
+
 const Marketplace: React.FC<MarketplaceProps> = ({ currentUser, onSelectRequest }) => {
     const [requests, setRequests] = useState<WorkRequest[]>([]);
     const [personas, setPersonas] = useState<Persona[]>([]);
@@ -65,7 +68,9 @@ const Marketplace: React.FC<MarketplaceProps> = ({ currentUser, onSelectRequest 
     const [newDesc, setNewDesc] = useState('');
     const [newCaps, setNewCaps] = useState<string[]>(['research']);
     const [selectedPersonaIds, setSelectedPersonaIds] = useState<number[]>([]);
+    const [requestAttachments, setRequestAttachments] = useState<File[]>([]);
     const [posting, setPosting] = useState(false);
+    const attachmentInputRef = useRef<HTMLInputElement | null>(null);
 
     const fetchRequests = useCallback(async () => {
         try {
@@ -101,18 +106,26 @@ const Marketplace: React.FC<MarketplaceProps> = ({ currentUser, onSelectRequest 
         if (!newTitle.trim() || !newDesc.trim() || posting) return;
         setPosting(true);
         try {
-            await axios.post(`${import.meta.env.VITE_API_URL}/api/marketplace`, {
-                title: newTitle.trim(),
-                description: newDesc.trim(),
-                requester_id: currentUser.id,
-                required_capabilities: newCaps,
-                selected_persona_ids: selectedPersonaIds,
+            const formData = new FormData();
+            formData.append('title', newTitle.trim());
+            formData.append('description', newDesc.trim());
+            formData.append('requester_id', String(currentUser.id));
+            formData.append('required_capabilities', JSON.stringify(newCaps));
+            formData.append('selected_persona_ids', JSON.stringify(selectedPersonaIds));
+            requestAttachments.forEach((file) => {
+                formData.append('attachments', file);
             });
+
+            await axios.post(`${import.meta.env.VITE_API_URL}/api/marketplace`, formData);
             toast.success('Work request posted to marketplace!');
             setNewTitle('');
             setNewDesc('');
             setNewCaps(['research']);
             setSelectedPersonaIds([]);
+            setRequestAttachments([]);
+            if (attachmentInputRef.current) {
+                attachmentInputRef.current.value = '';
+            }
             setShowPostForm(false);
             fetchRequests();
         } catch (err) {
@@ -200,7 +213,7 @@ const Marketplace: React.FC<MarketplaceProps> = ({ currentUser, onSelectRequest 
                             />
                         </div>
                         <div>
-                            <label className="block text-xs font-medium text-[var(--color-text-muted)] uppercase mb-1">Required Capabilities</label>
+                            <label className="block text-xs font-medium text-[var(--color-text-muted)] uppercase mb-1">Tags</label>
                             <select
                                 multiple
                                 value={newCaps}
@@ -214,7 +227,7 @@ const Marketplace: React.FC<MarketplaceProps> = ({ currentUser, onSelectRequest 
                                 ))}
                             </select>
                             <p className="text-[11px] text-[var(--color-text-muted)] mt-1">
-                                Hold Cmd/Ctrl to select multiple capabilities.
+                                Hold Cmd/Ctrl to select multiple tags.
                             </p>
                         </div>
                         <div>
@@ -257,6 +270,30 @@ const Marketplace: React.FC<MarketplaceProps> = ({ currentUser, onSelectRequest 
                                 Invited personas will see this as a pending request in My Workflows.
                             </p>
                         </div>
+                        <div>
+                            <label className="block text-xs font-medium text-[var(--color-text-muted)] uppercase mb-2">
+                                Upload Supporting Files (Optional)
+                            </label>
+                            <input
+                                ref={attachmentInputRef}
+                                type="file"
+                                accept=".pdf,.txt,.ppt,.pptx"
+                                multiple
+                                onChange={(event) => {
+                                    const files = Array.from(event.target.files || []);
+                                    setRequestAttachments(files);
+                                }}
+                                className="w-full text-xs text-[var(--color-text-secondary)]"
+                            />
+                            <p className="text-[11px] text-[var(--color-text-muted)] mt-1">
+                                Supported: PDF, TXT, PPT, PPTX.
+                            </p>
+                            {requestAttachments.length > 0 && (
+                                <p className="text-[11px] text-purple-300 mt-1">
+                                    {requestAttachments.length} file{requestAttachments.length === 1 ? '' : 's'} selected
+                                </p>
+                            )}
+                        </div>
                         <div className="flex justify-end gap-3 pt-2">
                             <button onClick={() => setShowPostForm(false)} className="px-4 py-2 text-sm text-[var(--color-text-secondary)]">
                                 Cancel
@@ -280,7 +317,9 @@ const Marketplace: React.FC<MarketplaceProps> = ({ currentUser, onSelectRequest 
                         No open requests at the moment.
                     </div>
                 ) : (
-                    requests.map((r) => (
+                    requests.map((r) => {
+                        const visibleVolunteers = r.volunteers.filter((v) => !isPendingDirectInvite(v));
+                        return (
                         <div
                             key={r.id}
                             onClick={() => onSelectRequest(r.id)}
@@ -315,20 +354,20 @@ const Marketplace: React.FC<MarketplaceProps> = ({ currentUser, onSelectRequest 
                                 <div className="mb-4">
                                     <p className="text-xs text-[var(--color-text-muted)] uppercase mb-2">Volunteers</p>
                                     <div className="flex -space-x-2">
-                                        {r.volunteers.length === 0 ? (
+                                        {visibleVolunteers.length === 0 ? (
                                             <span className="text-xs text-[var(--color-text-muted)] italic">No one yet</span>
                                         ) : (
-                                            r.volunteers.map((v) => (
+                                            visibleVolunteers.map((v) => (
                                                 <div key={v.id} className="w-8 h-8 rounded-full bg-[var(--color-surface-raised)] border-2 border-[var(--color-bg)] flex items-center justify-center text-[10px] text-white font-bold" title={v.user.name}>
                                                     {v.user.name.charAt(0)}
                                                 </div>
                                             ))
                                         )}
                                     </div>
-                                    {r.volunteers.length > 0 && (
+                                    {visibleVolunteers.length > 0 && (
                                         <p className="text-[10px] text-emerald-400 mt-2 font-medium">
-                                            {r.volunteers.length} volunteer{r.volunteers.length !== 1 ? 's' : ''}
-                                            {r.volunteers.some(v => v.user.is_agent) && ' (incl. AI)'}
+                                            {visibleVolunteers.length} volunteer{visibleVolunteers.length !== 1 ? 's' : ''}
+                                            {visibleVolunteers.some(v => v.user.is_agent) && ' (incl. AI)'}
                                         </p>
                                     )}
                                 </div>
@@ -340,7 +379,8 @@ const Marketplace: React.FC<MarketplaceProps> = ({ currentUser, onSelectRequest 
                                 </div>
                             </div>
                         </div>
-                    ))
+                        );
+                    })
                 )}
             </div>
         </div>

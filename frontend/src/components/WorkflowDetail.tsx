@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import axios from 'axios';
 
 interface User {
@@ -69,6 +69,15 @@ interface Workflow {
     updated_at: string;
 }
 
+interface WorkflowAttachment {
+    filename: string;
+    display_name: string;
+    extension: string;
+    size_bytes: number;
+    size_formatted: string;
+    uploaded_at: string;
+}
+
 interface WorkflowDetailProps {
     workflowId: number;
     currentUser: User;
@@ -109,6 +118,7 @@ const eventIcons: Record<string, string> = {
     reopened: '↩️',
     agent_replied: '🤖',
     notification_sent: '📨',
+    generation_warning: '⚠️',
     failed: '❌',
 };
 
@@ -123,9 +133,22 @@ const workflowStatusLabel: Record<string, string> = {
     failed: 'Failed',
 };
 
+const documentOnlyResearchExtensions = new Set(['.pdf', '.txt']);
+
 const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser, onBack }) => {
     const [workflow, setWorkflow] = useState<Workflow | null>(null);
+    const [attachments, setAttachments] = useState<WorkflowAttachment[]>([]);
+    const [submissionDocuments, setSubmissionDocuments] = useState<WorkflowAttachment[]>([]);
     const [loading, setLoading] = useState(true);
+    const [loadingAttachments, setLoadingAttachments] = useState(true);
+    const [loadingSubmissionDocuments, setLoadingSubmissionDocuments] = useState(true);
+    const [selectedAttachmentFile, setSelectedAttachmentFile] = useState<File | null>(null);
+    const [selectedSubmissionFile, setSelectedSubmissionFile] = useState<File | null>(null);
+    const [uploadingAttachment, setUploadingAttachment] = useState(false);
+    const [uploadingSubmissionDocument, setUploadingSubmissionDocument] = useState(false);
+    const [skipWebSearch, setSkipWebSearch] = useState(false);
+    const attachmentInputRef = useRef<HTMLInputElement | null>(null);
+    const submissionInputRef = useRef<HTMLInputElement | null>(null);
     const [feedback, setFeedback] = useState('');
     const [pptVerbosity, setPptVerbosity] = useState<'concise' | 'standard' | 'text-heavy'>('standard');
     const [chatInput, setChatInput] = useState('');
@@ -156,11 +179,57 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
         }
     }, [workflowId, currentUser.id]);
 
+    const fetchAttachments = useCallback(async () => {
+        try {
+            const res = await axios.get(
+                `${import.meta.env.VITE_API_URL}/api/workflows/${workflowId}/attachments`,
+                { params: { user_id: currentUser.id } }
+            );
+            setAttachments(res.data.attachments || []);
+        } catch (err) {
+            console.error('Failed to fetch workflow attachments:', err);
+        } finally {
+            setLoadingAttachments(false);
+        }
+    }, [workflowId, currentUser.id]);
+
+    const fetchSubmissionDocuments = useCallback(async () => {
+        try {
+            const res = await axios.get(
+                `${import.meta.env.VITE_API_URL}/api/workflows/${workflowId}/submission-documents`,
+                { params: { user_id: currentUser.id } }
+            );
+            setSubmissionDocuments(res.data.documents || []);
+        } catch (err) {
+            console.error('Failed to fetch submission documents:', err);
+        } finally {
+            setLoadingSubmissionDocuments(false);
+        }
+    }, [workflowId, currentUser.id]);
+
     useEffect(() => {
         fetchWorkflow();
-        const interval = setInterval(fetchWorkflow, 3000);
+        fetchAttachments();
+        fetchSubmissionDocuments();
+        const interval = setInterval(() => {
+            fetchWorkflow();
+            fetchAttachments();
+            fetchSubmissionDocuments();
+        }, 3000);
         return () => clearInterval(interval);
-    }, [fetchWorkflow]);
+    }, [fetchWorkflow, fetchAttachments, fetchSubmissionDocuments]);
+
+    useEffect(() => {
+        setSkipWebSearch(false);
+        setSelectedAttachmentFile(null);
+        setSelectedSubmissionFile(null);
+        if (attachmentInputRef.current) {
+            attachmentInputRef.current.value = '';
+        }
+        if (submissionInputRef.current) {
+            submissionInputRef.current.value = '';
+        }
+    }, [workflowId]);
 
     useEffect(() => {
         if (!workflow || pendingAgentReplyAfterMessageId === null) return;
@@ -239,10 +308,15 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
 
     const handleStartResearch = async () => {
         if (triggeringResearch) return;
+        if (skipWebSearch && !hasDocumentOnlySource) {
+            alert('Upload at least one PDF or TXT document before using Skip web search.');
+            return;
+        }
         setTriggeringResearch(true);
         try {
             await axios.post(`${import.meta.env.VITE_API_URL}/api/workflows/${workflowId}/start-research`, {
-                user_id: currentUser.id
+                user_id: currentUser.id,
+                skip_web_search: skipWebSearch
             });
             fetchWorkflow();
         } catch (err: any) {
@@ -250,6 +324,53 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
             alert(err.response?.data?.error || 'Failed to start research');
         } finally {
             setTriggeringResearch(false);
+        }
+    };
+
+    const handleUploadAttachment = async () => {
+        if (uploadingAttachment || !selectedAttachmentFile) return;
+        setUploadingAttachment(true);
+        try {
+            const formData = new FormData();
+            formData.append('user_id', String(currentUser.id));
+            formData.append('file', selectedAttachmentFile);
+            await axios.post(`${import.meta.env.VITE_API_URL}/api/workflows/${workflowId}/attachments`, formData);
+            setSelectedAttachmentFile(null);
+            if (attachmentInputRef.current) {
+                attachmentInputRef.current.value = '';
+            }
+            fetchAttachments();
+            fetchWorkflow();
+        } catch (err: any) {
+            console.error('Failed to upload attachment:', err);
+            alert(err.response?.data?.error || 'Failed to upload document');
+        } finally {
+            setUploadingAttachment(false);
+        }
+    };
+
+    const handleUploadSubmissionDocument = async () => {
+        if (uploadingSubmissionDocument || !selectedSubmissionFile) return;
+        setUploadingSubmissionDocument(true);
+        try {
+            const formData = new FormData();
+            formData.append('user_id', String(currentUser.id));
+            formData.append('file', selectedSubmissionFile);
+            await axios.post(
+                `${import.meta.env.VITE_API_URL}/api/workflows/${workflowId}/submission-documents`,
+                formData
+            );
+            setSelectedSubmissionFile(null);
+            if (submissionInputRef.current) {
+                submissionInputRef.current.value = '';
+            }
+            fetchSubmissionDocuments();
+            fetchWorkflow();
+        } catch (err: any) {
+            console.error('Failed to upload submission document:', err);
+            alert(err.response?.data?.error || 'Failed to upload submission document');
+        } finally {
+            setUploadingSubmissionDocument(false);
         }
     };
 
@@ -362,6 +483,12 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
     const generationStatusMessage = generationStep?.output_data?.status_message as string | undefined;
     const generationAttempt = generationStep?.output_data?.attempt as number | undefined;
     const generationMaxAttempts = generationStep?.output_data?.max_attempts as number | undefined;
+    const sourceValidation = generationStep?.output_data?.source_url_validation as { ok?: boolean } | undefined;
+    const generationWarningNote = (
+        generationStep?.output_data?.warning_note as string | undefined
+    ) || (sourceValidation && sourceValidation.ok === false
+        ? 'The generated PPT may not have a dedicated sources slide.'
+        : undefined);
     const isGenerationFailed = generationStep?.status === 'failed';
 
     const pipelineStageTypes = ['agent_collaboration', 'agent_research', 'human_review', 'agent_generation'];
@@ -429,6 +556,9 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
     const agentRespondingCopy = isWaitingForInitialKickoffReply
         ? 'OpenClaw is reviewing the request and drafting the kickoff confirmation...'
         : 'OpenClaw is working on a response...';
+    const hasDocumentOnlySource = attachments.some((attachment) =>
+        documentOnlyResearchExtensions.has((attachment.extension || '').toLowerCase())
+    );
 
     const humanApprovals = workflow.approvals.filter(a => !a.user?.is_agent);
     const currentApproval = humanApprovals.find(a => a.user_id === currentUser.id);
@@ -602,6 +732,11 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                                     </p>
                                 </div>
                             </div>
+                            {generationWarningNote && (
+                                <p className="text-xs text-[var(--color-warning)] mt-3">
+                                    Note: {generationWarningNote}
+                                </p>
+                            )}
                         </div>
                     )}
 
@@ -821,13 +956,36 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                         </div>
 
                         {canStartResearch && (
-                            <button
-                                onClick={handleStartResearch}
-                                disabled={triggeringResearch || workflow.status === 'generating_ppt'}
-                                className="btn btn-success mt-3 w-full"
-                            >
-                                {triggeringResearch ? 'Starting...' : 'Start Agent Research'}
-                            </button>
+                            <div className="mt-3">
+                                <label className="flex items-center gap-2 text-xs text-[var(--color-text-secondary)] mb-2">
+                                    <input
+                                        type="checkbox"
+                                        checked={skipWebSearch}
+                                        onChange={(event) => setSkipWebSearch(event.target.checked)}
+                                    />
+                                    Skip web search (use uploaded documents only)
+                                </label>
+                                {skipWebSearch && !hasDocumentOnlySource && (
+                                    <p className="text-xs text-[var(--color-warning)] mb-2">
+                                        Upload at least one PDF/TXT file to start document-only research.
+                                    </p>
+                                )}
+                                <button
+                                    onClick={handleStartResearch}
+                                    disabled={
+                                        triggeringResearch
+                                        || workflow.status === 'generating_ppt'
+                                        || (skipWebSearch && !hasDocumentOnlySource)
+                                    }
+                                    className="btn btn-success w-full"
+                                >
+                                    {triggeringResearch
+                                        ? 'Starting...'
+                                        : skipWebSearch
+                                            ? 'Start Agent Research (Documents Only)'
+                                            : 'Start Agent Research'}
+                                </button>
+                            </div>
                         )}
 
                     </div>
@@ -860,7 +1018,126 @@ const WorkflowDetail: React.FC<WorkflowDetailProps> = ({ workflowId, currentUser
                     )}
                 </div>
 
-                <div className="lg:col-span-1">
+                <div className="lg:col-span-1 space-y-4">
+                    <div className="glass-card p-5">
+                        <h3 className="text-white font-semibold mb-3 text-sm uppercase tracking-wider">
+                            Source Documents
+                        </h3>
+                        <p className="text-xs text-[var(--color-text-muted)] mb-3">
+                            Upload PDF, TXT, PPT, or PPTX files for collaborators.
+                            For document-only agent research, use PDF/TXT.
+                        </p>
+                        <div className="flex flex-col gap-2">
+                            <input
+                                ref={attachmentInputRef}
+                                type="file"
+                                accept=".pdf,.txt,.ppt,.pptx"
+                                onChange={(event) => {
+                                    const nextFile = event.target.files?.[0] || null;
+                                    setSelectedAttachmentFile(nextFile);
+                                }}
+                                className="text-xs text-[var(--color-text-secondary)]"
+                                disabled={uploadingAttachment}
+                            />
+                            <button
+                                onClick={handleUploadAttachment}
+                                disabled={!selectedAttachmentFile || uploadingAttachment}
+                                className="btn btn-outline text-xs px-3 py-2"
+                            >
+                                {uploadingAttachment ? 'Uploading...' : 'Upload'}
+                            </button>
+                        </div>
+
+                        <div className="mt-3 space-y-2 max-h-48 overflow-y-auto">
+                            {loadingAttachments ? (
+                                <p className="text-xs text-[var(--color-text-muted)]">Loading documents...</p>
+                            ) : attachments.length === 0 ? (
+                                <p className="text-xs text-[var(--color-text-muted)]">No documents uploaded yet.</p>
+                            ) : (
+                                attachments.map((attachment) => (
+                                    <div
+                                        key={attachment.filename}
+                                        className="flex items-center justify-between gap-3 text-xs"
+                                    >
+                                        <div className="min-w-0">
+                                            <p className="text-[var(--color-text-secondary)] truncate">
+                                                {attachment.display_name}
+                                            </p>
+                                            <p className="text-[10px] text-[var(--color-text-muted)]">
+                                                {attachment.size_formatted} · {formatDate(attachment.uploaded_at)}
+                                            </p>
+                                        </div>
+                                        <a
+                                            href={`${import.meta.env.VITE_API_URL}/api/workflows/${workflowId}/attachments/${encodeURIComponent(attachment.filename)}?user_id=${currentUser.id}`}
+                                            className="text-purple-300 hover:text-purple-200 whitespace-nowrap"
+                                        >
+                                            Download
+                                        </a>
+                                    </div>
+                                ))
+                            )}
+                        </div>
+                    </div>
+
+                    <div className="glass-card p-5">
+                        <h3 className="text-white font-semibold mb-3 text-sm uppercase tracking-wider">
+                            Submission Documents
+                        </h3>
+                        <p className="text-xs text-[var(--color-text-muted)] mb-3">
+                            Workers can upload their deliverables here (PDF, TXT, PPT, PPTX).
+                        </p>
+                        <div className="flex flex-col gap-2">
+                            <input
+                                ref={submissionInputRef}
+                                type="file"
+                                accept=".pdf,.txt,.ppt,.pptx"
+                                onChange={(event) => {
+                                    const nextFile = event.target.files?.[0] || null;
+                                    setSelectedSubmissionFile(nextFile);
+                                }}
+                                className="text-xs text-[var(--color-text-secondary)]"
+                                disabled={uploadingSubmissionDocument}
+                            />
+                            <button
+                                onClick={handleUploadSubmissionDocument}
+                                disabled={!selectedSubmissionFile || uploadingSubmissionDocument}
+                                className="btn btn-outline text-xs px-3 py-2"
+                            >
+                                {uploadingSubmissionDocument ? 'Uploading...' : 'Upload Submission'}
+                            </button>
+                        </div>
+
+                        <div className="mt-3 space-y-2 max-h-48 overflow-y-auto">
+                            {loadingSubmissionDocuments ? (
+                                <p className="text-xs text-[var(--color-text-muted)]">Loading submission documents...</p>
+                            ) : submissionDocuments.length === 0 ? (
+                                <p className="text-xs text-[var(--color-text-muted)]">No submission documents uploaded yet.</p>
+                            ) : (
+                                submissionDocuments.map((document) => (
+                                    <div
+                                        key={document.filename}
+                                        className="flex items-center justify-between gap-3 text-xs"
+                                    >
+                                        <div className="min-w-0">
+                                            <p className="text-[var(--color-text-secondary)] truncate">
+                                                {document.display_name}
+                                            </p>
+                                            <p className="text-[10px] text-[var(--color-text-muted)]">
+                                                {document.size_formatted} · {formatDate(document.uploaded_at)}
+                                            </p>
+                                        </div>
+                                        <a
+                                            href={`${import.meta.env.VITE_API_URL}/api/workflows/${workflowId}/submission-documents/${encodeURIComponent(document.filename)}?user_id=${currentUser.id}`}
+                                            className="text-purple-300 hover:text-purple-200 whitespace-nowrap"
+                                        >
+                                            Download
+                                        </a>
+                                    </div>
+                                ))
+                            )}
+                        </div>
+                    </div>
+
                     <div className="glass-card-static p-5 sticky top-6">
                         <h3 className="text-white font-semibold mb-4 text-sm uppercase tracking-wider">
                             Activity Timeline

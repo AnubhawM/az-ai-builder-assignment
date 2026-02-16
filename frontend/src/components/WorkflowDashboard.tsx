@@ -59,9 +59,6 @@ const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSe
     const [workflows, setWorkflows] = useState<WorkflowSummary[]>([]);
     const [invites, setInvites] = useState<MarketplaceInvite[]>([]);
     const [loading, setLoading] = useState(true);
-    const [showNewForm, setShowNewForm] = useState(false);
-    const [newTopic, setNewTopic] = useState('');
-    const [creating, setCreating] = useState(false);
     const [deletingWorkflowId, setDeletingWorkflowId] = useState<number | null>(null);
     const [acceptingInviteId, setAcceptingInviteId] = useState<number | null>(null);
 
@@ -99,26 +96,6 @@ const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSe
         }, 5000);
         return () => clearInterval(interval);
     }, [fetchInvites, fetchWorkflows]);
-
-    const handleCreateWorkflow = async () => {
-        if (!newTopic.trim() || creating) return;
-        setCreating(true);
-        try {
-            const res = await axios.post(`${import.meta.env.VITE_API_URL}/api/workflows`, {
-                topic: newTopic.trim(),
-                user_id: currentUser.id,
-                workflow_type: 'ppt_generation',
-            });
-            setNewTopic('');
-            setShowNewForm(false);
-            // Navigate to the newly created workflow
-            onSelectWorkflow(res.data.workflow.id);
-        } catch (err) {
-            console.error('Failed to create workflow:', err);
-        } finally {
-            setCreating(false);
-        }
-    };
 
     const handleCardKeyDown = (event: React.KeyboardEvent<HTMLDivElement>, workflowId: number) => {
         if (event.key !== 'Enter' && event.key !== ' ') return;
@@ -217,44 +194,6 @@ const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSe
                     </p>
                 </div>
             </div>
-
-            {/* New Workflow Form */}
-            {showNewForm && (
-                <div className="glass-card p-6 mb-6">
-                    <h3 className="text-white font-semibold mb-3">Create New Research Workflow</h3>
-                    <div className="flex gap-3">
-                        <input
-                            type="text"
-                            value={newTopic}
-                            onChange={(e) => setNewTopic(e.target.value)}
-                            placeholder="Enter a research topic (e.g., Sustainable energy technologies for AZ manufacturing)"
-                            className="flex-1 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg px-4 py-3 text-white text-sm placeholder:text-[var(--color-text-muted)] focus:outline-none focus:border-purple-500"
-                            onKeyDown={(e) => e.key === 'Enter' && handleCreateWorkflow()}
-                            disabled={creating}
-                            id="new-workflow-topic"
-                        />
-                        <button
-                            onClick={handleCreateWorkflow}
-                            disabled={!newTopic.trim() || creating}
-                            className="btn btn-primary whitespace-nowrap"
-                            id="submit-workflow-btn"
-                        >
-                            {creating ? (
-                                <>
-                                    <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin-slow" />
-                                    Starting...
-                                </>
-                            ) : (
-                                'Start Research'
-                            )}
-                        </button>
-                    </div>
-                    <p className="text-[var(--color-text-muted)] text-xs mt-2">
-                        OpenClaw will research the topic and produce an executive summary and slide outline for your review.
-                    </p>
-                </div>
-            )}
-
             {/* Pending Collaboration Requests */}
             <section className="mb-8">
                 <h3 className="text-sm font-semibold text-[var(--color-text-secondary)] uppercase tracking-wider mb-3">
@@ -329,9 +268,7 @@ const WorkflowDashboard: React.FC<WorkflowDashboardProps> = ({ currentUser, onSe
                 {activeWorkflows.length === 0 ? (
                     <div className="glass-card-static p-8 text-center">
                         <p className="text-[var(--color-text-muted)]">
-                            {currentUser.role === 'researcher'
-                                ? 'No active workflows. Click "New Request" to start one.'
-                                : 'No workflows awaiting your input.'}
+                            No workflows awaiting your input.
                         </p>
                     </div>
                 ) : (
